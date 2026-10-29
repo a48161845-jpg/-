@@ -1,36 +1,52 @@
+"""Свои команды (триггеры): слово или фраза -> ответ (текст или медиа).
+
+Как в обычных ботах: триггер пишется как есть, регистр не важен, префикс (. ! / ,) необязателен.
+Режимы срабатывания: «начало» (сообщение начинается с триггера, остальное — аргументы),
+«точно» (сообщение целиком равно триггеру), «слово» (триггер встречается в тексте).
+"""
 import re
-from datetime import datetime
+import time
 
 import config
 import db
-from core import PREFIXES, REG, canon, esc, mention, user_link
-from core import cmd, resolve_target
+from core import PREFIXES, REG, canon, cmd, esc, mention
+
+MODES = {"start": "в начале", "exact": "точно", "word": "в тексте"}
+MODE_WORDS = {"начало": "start", "точно": "exact", "слово": "word"}
+MODE_ORDER = ["start", "exact", "word"]
 
 VARS_HELP = """\
-<b>Переменные:</b>
-<code>{args}</code> — всё, что написано после команды
-<code>{1}</code> <code>{2}</code> … — первое, второе слово после команды
-<code>{имя_фамилия}</code> (или <code>{Name и фамилия}</code>) — текст после команды, а если его нет — имя автора/человека из ответа
-<code>{name}</code> — имя автора, <code>{first}</code> — имя, <code>{last}</code> — фамилия
-<code>{username}</code> — @ник автора, <code>{id}</code> — ID, <code>{mention}</code> — упоминание
-<code>{reply}</code> — имя того, на чьё сообщение ответили (<code>{reply_username}</code>, <code>{reply_id}</code>, <code>{reply_mention}</code>)
-<code>{points}</code> и <code>{total}</code> — баллы автора
-<code>{team}</code> — команда, <code>{chat}</code> — чат, <code>{date}</code>, <code>{time}</code>"""
+<b>Переменные в ответе:</b>
+<code>{args}</code> — текст после триггера, <code>{1}</code> <code>{2}</code> — первое/второе слово
+<code>{имя_фамилия}</code> — текст после триггера, а если его нет — имя автора (или того, на кого ответили)
+<code>{name}</code> <code>{first}</code> <code>{last}</code> — имя автора, <code>{username}</code>, <code>{id}</code>, <code>{mention}</code>
+<code>{reply}</code> <code>{reply_mention}</code> — тот, на чьё сообщение ответили
+<code>{points}</code> — баланс, <code>{team}</code> — команда, <code>{chat}</code>, <code>{date}</code>, <code>{time}</code>"""
+
+_cache = {}
+_last = {}
 
 
-def _norm(k):
+def norm_trig(s):
+    """Триггер в каноничном виде: нижний регистр, без префикса в начале, одинарные пробелы."""
+    s = re.sub(r"\s+", " ", (s or "").strip().lower())
+    return s.lstrip(PREFIXES).strip()
+
+
+def _norm_var(k):
     return re.sub(r"[\s_]+", "", k.lower())
 
 
 async def _vars(m, args):
-    from economy import get_points, get_total
+    from economy import get_balance, get_home
+    from games import now
     u = m.from_user
     r = m.reply_to_message.from_user if m.reply_to_message and m.reply_to_message.from_user else None
     first, _, last = u.full_name.partition(" ")
     words = args.split()
-    key = config.team_key(m.chat.id)
-    from games import now
+    home = await get_home(u.id)
     full = args.strip() or (r.full_name if r else u.full_name)
+    bal = f"{await get_balance(u.id):g}"
     v = {
         "args": args.strip(), "текст": args.strip(),
         "name": u.full_name, "имя": first, "first": first, "last": last, "фамилия": last,
@@ -38,63 +54,113 @@ async def _vars(m, args):
         "mention": mention(u.id, u.full_name),
         "reply": r.full_name if r else "", "reply_username": (f"@{r.username}" if r.username else r.full_name) if r else "",
         "replyid": str(r.id) if r else "", "replymention": mention(r.id, r.full_name) if r else "",
-        "points": f"{await get_points(u.id, key):g}" if key else "0", "total": f"{await get_total(u.id):g}",
-        "team": config.TEAMS[key]["title"] if key else "", "chat": m.chat.title or "",
+        "points": bal, "total": bal, "баллы": bal,
+        "team": config.TEAMS[home]["title"] if home in config.TEAMS else "", "chat": m.chat.title or "",
         "date": now().strftime("%d.%m.%Y"), "time": now().strftime("%H:%M"),
-        "nameифамилия": full, "имяифамилия": full, "имяфамилия": full,
-        "full": full, "fullname": full,
+        "nameифамилия": full, "имяифамилия": full, "имяфамилия": full, "full": full, "fullname": full,
     }
     for i, w in enumerate(words, 1):
         v[str(i)] = w
     return v
 
 
-def _esc_vals(v, raw=("mention", "replymention")):
-    return {k: (x if k in raw else esc(x)) for k, x in v.items()}
-
-
 async def render(m, text, args):
-    v = _esc_vals(await _vars(m, args))
-    return re.sub(r"\{([^{}]+)\}", lambda mo: v.get(_norm(mo.group(1)), mo.group(0)), text)
+    raw = ("mention", "replymention")
+    v = {k: (x if k in raw else esc(x)) for k, x in (await _vars(m, args)).items()}
+    return re.sub(r"\{([^{}]+)\}", lambda mo: v.get(_norm_var(mo.group(1)), mo.group(0)), text)
 
 
-_cache = {}
+# ---------- хранилище ----------
+def invalidate(chat_id):
+    _cache.pop(chat_id, None)
 
 
-async def _rows(chat_id):
+def _compile(trig, mode):
+    words = r"\s+".join(re.escape(w) for w in trig.split())
+    pre = "[" + re.escape(PREFIXES) + "]*"
+    if mode == "exact":
+        return re.compile(rf"^{pre}{words}$", re.I)
+    if mode == "word":
+        return re.compile(rf"(?<!\w){words}(?!\w)", re.I)
+    return re.compile(rf"^{pre}{words}(?!\w)", re.I)
+
+
+async def rows(chat_id):
+    """Команды чата (с id для кнопок), самые длинные триггеры первыми."""
     if chat_id not in _cache:
-        rows = await db.q("SELECT name,text,mtype,fid FROM custom WHERE chat_id=?", (chat_id,))
-        _cache[chat_id] = sorted(rows, key=lambda r: -len(r["name"]))
+        out = []
+        for r in await db.q("SELECT rowid AS rid, name, text, mtype, fid, mode FROM custom WHERE chat_id=?", (chat_id,)):
+            trig = norm_trig(r["name"])
+            mode = r["mode"] if r["mode"] in MODES else "start"
+            if trig:
+                out.append({"rid": r["rid"], "raw": r["name"], "trig": trig, "text": r["text"] or "", "mtype": r["mtype"],
+                            "fid": r["fid"], "mode": mode, "rx": _compile(trig, mode)})
+        _cache[chat_id] = sorted(out, key=lambda x: -len(x["trig"]))
     return _cache[chat_id]
 
 
-def _bound(text, phrase):
-    return text.startswith(phrase) and (len(text) == len(phrase) or text[len(phrase)].isspace())
+async def by_rid(chat_id, rid):
+    return next((r for r in await rows(chat_id) if r["rid"] == rid), None)
 
 
+def check_trigger(trig):
+    """None, если триггер годится, иначе текст ошибки."""
+    if not trig:
+        return "Пустой триггер."
+    if trig[0] in "+-":
+        return "Триггер не может начинаться с + или -."
+    if canon(trig.split()[0]) in REG:
+        return "Это имя занято встроенной командой."
+    if len(trig) > 60:
+        return "Слишком длинный триггер (до 60 символов)."
+    return None
+
+
+async def save(chat_id, trig, text, mtype, fid, mode="start"):
+    """Создаёт или обновляет команду. True, если обновили существующую."""
+    old = next((r for r in await rows(chat_id) if r["trig"] == trig), None)
+    if old:
+        await db.x("DELETE FROM custom WHERE chat_id=? AND name=?", (chat_id, old["raw"]))
+    await db.x("INSERT OR REPLACE INTO custom(chat_id,name,text,mtype,fid,mode) VALUES(?,?,?,?,?,?)",
+               (chat_id, trig, text, mtype, fid, mode))
+    invalidate(chat_id)
+    return bool(old)
+
+
+async def delete(chat_id, rid):
+    r = await by_rid(chat_id, rid)
+    if r:
+        await db.x("DELETE FROM custom WHERE chat_id=? AND name=?", (chat_id, r["raw"]))
+        invalidate(chat_id)
+    return r
+
+
+async def set_mode(chat_id, rid, mode):
+    r = await by_rid(chat_id, rid)
+    if r:
+        await db.x("UPDATE custom SET mode=? WHERE chat_id=? AND name=?", (mode, chat_id, r["raw"]))
+        invalidate(chat_id)
+
+
+# ---------- срабатывание ----------
 async def run_custom(m, text, bot):
-    """Ищет пользовательскую команду по началу сообщения; True, если нашлась и выполнена."""
+    """Ищет подходящую команду в сообщении; True, если нашлась и выполнена."""
     t = text.strip()
-    low = t.lower()
     hit = None
-    for r in await _rows(m.chat.id):
-        trig = r["name"]
-        if trig[0] in PREFIXES:                      # только с префиксом: .ник !ник ,ник /ник
-            ph = trig[1:]
-            if low[:1] in PREFIXES and _bound(low[1:].replace("_", ""), ph.replace("_", "")):
-                hit = (r, 1 + len(ph))
-        else:                                        # без префикса: «ник», «.ник», «кто тут»
-            if _bound(low, trig):
-                hit = (r, len(trig))
-            elif low[:1] in PREFIXES and _bound(low[1:], trig):
-                hit = (r, 1 + len(trig))
-        if hit:
+    for r in await rows(m.chat.id):
+        mo = r["rx"].search(t)
+        if mo:
+            hit = (r, t[mo.end():].strip() if r["mode"] != "exact" else "")
             break
     if not hit:
         return False
-    r, n = hit
-    args = t[n:].strip()
-    out = await render(m, r["text"] or "", args) if r["text"] else ""
+    r, args = hit
+    if r["mode"] == "word":  # реакция на слово в обычном тексте — не чаще раза в 5 секунд
+        k = (m.chat.id, r["trig"])
+        if time.time() - _last.get(k, 0) < 5:
+            return False
+        _last[k] = time.time()
+    out = await render(m, r["text"], args) if r["text"] else ""
     kw = {"reply_to_message_id": m.reply_to_message.message_id} if m.reply_to_message else {}
     try:
         if r["mtype"]:
@@ -114,7 +180,7 @@ async def run_custom(m, text, bot):
     return True
 
 
-def _media(msg):
+def media_of(msg):
     if not msg:
         return None, None
     for kind in ("photo", "video", "animation", "document", "audio", "voice", "sticker", "video_note"):
@@ -124,55 +190,65 @@ def _media(msg):
     return None, None
 
 
-def _split_trigger(args):
-    """'"кто тут" ответ' -> ('кто тут','ответ'); 'ник текст' -> ('ник','текст')."""
-    a = args.strip()
+def split_args(args):
+    """'[режим] триггер ответ' -> (режим, триггер, ответ). Фраза-триггер — в кавычках."""
+    a = (args or "").strip()
+    mode = "start"
+    w = a.split(None, 1)
+    if len(w) == 2 and w[0].lower() in MODE_WORDS:
+        mode, a = MODE_WORDS[w[0].lower()], w[1].strip()
     if a and a[0] in "\"«“":
         close = {"\"": "\"", "«": "»", "“": "”"}[a[0]]
         j = a.find(close, 1)
         if j > 0:
-            return a[1:j].strip().lower(), a[j + 1:].strip()
+            return mode, norm_trig(a[1:j]), a[j + 1:].strip()
     p = a.split(None, 1)
-    return (p[0].lower(), p[1] if len(p) > 1 else "") if p else ("", "")
+    return (mode, norm_trig(p[0]), p[1] if len(p) > 1 else "") if p else (mode, "", "")
+
+
+HOWTO = ("Формат: <code>+кмд триггер ответ</code> или ответом на сообщение: <code>+кмд триггер</code> (подойдёт и фото, гиф, стикер, файл, голосовое).\n"
+         "Фраза — в кавычках: <code>+кмд \"кто тут\" Все тут</code>.\n"
+         "Режим первым словом: <code>+кмд точно привет Привет!</code> · <code>начало</code> (по умолчанию) · <code>точно</code> · <code>слово</code>.")
 
 
 @cmd("+кмд", "+команда", perm="settings")
 async def c_add(m, args, bot):
-    trig, text = _split_trigger(args)
+    mode, trig, text = split_args(args)
     rep = m.reply_to_message
-    mtype, fid = _media(rep)
-    if rep and not text and not mtype:
-        text = rep.text or rep.caption or ""
-    if rep and mtype and not text:
-        text = rep.caption or ""
-    if not trig or not (text or mtype):
-        return await m.reply(
-            "Формат: <code>+кмд ник MD | {Name и фамилия}</code> — потом <code>.ник Иван Иванов</code> → <code>MD | Иван Иванов</code>\n"
-            "• Триггер любой: слово, фраза в кавычках <code>+кмд \"кто тут\" Все тут</code>, с точкой (<code>.ник</code> — только с префиксом) или без.\n"
-            "• Данные любые: текст, а также фото/гиф/видео/стикер/файл/голосовое — ответьте <code>+кмд триггер [подпись]</code> на сообщение с этим.\n\n" + VARS_HELP)
-    base = trig[1:] if trig[0] in PREFIXES else trig
-    if not base or trig[0] in "+-" or canon(base) in REG:
-        return await m.reply("❗ Такое имя занято встроенной командой или некорректно.")
-    await db.x("INSERT OR REPLACE INTO custom(chat_id,name,text,mtype,fid) VALUES(?,?,?,?,?)", (m.chat.id, trig, text, mtype, fid))
-    _cache.pop(m.chat.id, None)
-    await m.reply(f"✅ Триггер <code>{esc(trig)}</code> создан" + (f" ({mtype})" if mtype else "") + ".")
+    mtype, fid = media_of(rep)
+    if text:
+        text = esc(text)  # набранное в команде — обычный текст
+    elif rep and (rep.text or rep.caption):
+        text = rep.html_text or ""  # из ответа берём с форматированием
+    err = check_trigger(trig)
+    if err or not (text or mtype):
+        return await m.reply((f"❗ {err}\n\n" if err else "") + HOWTO + "\n\n" + VARS_HELP)
+    upd = await save(m.chat.id, trig, text, mtype, fid, mode)
+    await m.reply(f"✅ Команда <code>{esc(trig)}</code> {'обновлена' if upd else 'создана'} (срабатывает: {MODES[mode]}"
+                  + (f", {mtype}" if mtype else "") + ").")
 
 
 @cmd("-кмд", "-команда", perm="settings")
 async def c_del(m, args, bot):
-    trig, _ = _split_trigger(args)
-    row = await db.one("SELECT 1 x FROM custom WHERE chat_id=? AND name=?", (m.chat.id, trig))
-    if not row:
-        return await m.reply("Такого триггера нет. Список: <code>.кмды</code>")
-    await db.x("DELETE FROM custom WHERE chat_id=? AND name=?", (m.chat.id, trig))
-    _cache.pop(m.chat.id, None)
-    await m.reply(f"🗑 Триггер <code>{esc(trig)}</code> удалён.")
+    a = (args or "").strip()
+    items = sorted(await rows(m.chat.id), key=lambda r: r["trig"])
+    if a.isdigit():
+        r = items[int(a) - 1] if 1 <= int(a) <= len(items) else None
+    else:
+        _, trig, _ = split_args(a) if a[:1] in "\"«“" else ("start", norm_trig(a), "")
+        r = next((x for x in items if x["trig"] == trig), None)
+    if not r:
+        return await m.reply("Такой команды нет. Список: <code>.кмды</code>")
+    await delete(m.chat.id, r["rid"])
+    await m.reply(f"🗑 Команда <code>{esc(r['trig'])}</code> удалена.")
 
 
 @cmd(".кмды", ".кастом")
 async def c_list(m, args, bot):
-    rows = await _rows(m.chat.id)
-    if not rows:
-        return await m.reply("Своих команд пока нет. Создать: <code>+кмд ник MD | {Name и фамилия}</code>\n\n" + VARS_HELP)
+    items = sorted(await rows(m.chat.id), key=lambda r: r["trig"])
+    if not items:
+        return await m.reply("Своих команд пока нет.\n\n" + HOWTO)
     await m.reply("🧩 <b>Свои команды:</b>\n" + "\n".join(
-        f"• <code>{esc(r['name'])}</code> — " + (f"[{r['mtype']}] " if r["mtype"] else "") + esc((r["text"] or "")[:60]) for r in sorted(rows, key=lambda r: r["name"])))
+        f"{i}. <code>{esc(r['trig'])}</code> · {MODES[r['mode']]} — " + (f"[{r['mtype']}] " if r["mtype"] else "")
+        + esc(re.sub(r"<[^>]+>", "", r["text"])[:50]) for i, r in enumerate(items, 1))
+        + "\n\nУдалить: <code>-кмд номер</code>. Всё остальное — в <code>.настройки</code> → Команды.")

@@ -2,7 +2,9 @@ import asyncio
 import html
 import json
 import re
+import time
 import unicodedata
+from datetime import datetime
 
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
@@ -10,7 +12,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 import config
 import db
 from core import cb, cmd, esc, has_perm, mention, resolve_target, user_link
-from economy import get_points
+from economy import get_balance
 
 PH = "———"
 CAPMARK = "⁣"  # невидимая метка: эта строка — место капитана
@@ -74,8 +76,8 @@ def label(u, mode):
     return mention(u["id"], u["name"])
 
 
-def render(tpl, state, mode, twins=()):
-    """Игроки заполняют места по порядку; твины занимают места как отдельные игроки (идут после основных)."""
+def render(tpl, state, mode):
+    """Игроки заполняют места по порядку."""
     players = state.get("players", [])
     cap = state.get("captain")
     out, si = [], 0
@@ -87,36 +89,24 @@ def render(tpl, state, mode, twins=()):
                 parts = line.split(PH)
                 line = parts[0]
                 for tail in parts[1:]:
-                    if si < len(players):
-                        p = players[si]
-                        line += label(p, mode) + (" <i>(твин)</i>" if p["id"] in twins else "")
-                    else:
-                        line += PH
-                    line += tail
+                    line += (label(players[si], mode) if si < len(players) else PH) + tail
                     si += 1
         out.append(line)
     return "\n".join(out)
 
 
-async def twin_ids(chat_id):
-    return {r["user_id"] for r in await db.q("SELECT user_id FROM twins WHERE chat_id=?", (chat_id,))}
-
-
-async def sorted_state(chat_id, state, twins):
-    """Сначала основные игроки (выполнившие норму — выше), затем твины."""
-    key = config.team_key(chat_id)
+async def sorted_state(chat_id, state):
+    """Выполнившие норму (баланс не ниже нормы) стоят в списке выше."""
     norm = float(await db.get_setting(chat_id, "norm", "0") or 0)
-    main = [p for p in state["players"] if p["id"] not in twins]
-    tw = [p for p in state["players"] if p["id"] in twins]
-    if key and norm > 0:
-        met = {p["id"]: await get_points(p["id"], key) >= norm for p in main}
-        main.sort(key=lambda p: not met[p["id"]])
-    return {"captain": state.get("captain"), "players": main + tw}
+    players = list(state["players"])
+    if config.team_key(chat_id) and norm > 0:
+        met = {p["id"]: await get_balance(p["id"]) >= norm for p in players}
+        players.sort(key=lambda p: not met[p["id"]])
+    return {"captain": state.get("captain"), "players": players}
 
 
 async def full_text(chat_id, row, state):
-    tw = await twin_ids(chat_id)
-    return render(row["template"], await sorted_state(chat_id, state, tw), row["mode"], tw)
+    return render(row["template"], await sorted_state(chat_id, state), row["mode"])
 
 
 def is_full(row, state):
@@ -213,32 +203,6 @@ async def c_all(m, args, bot):
     await m.reply("📋 Номера списков: " + (", ".join(f"{r['num']}{'🖼' if r['photo'] else ''}" for r in rows) if rows else "пока нет"))
 
 
-@cmd(".твин", perm="lists")
-async def c_twin(m, args, bot):
-    uid, _ = await resolve_target(m, args)
-    if uid is None:
-        return await m.reply("Формат: <code>.твин @username</code> или ID (или ответом на сообщение). Повторная команда снимает отметку.")
-    r = await db.one("SELECT 1 FROM twins WHERE chat_id=? AND user_id=?", (m.chat.id, uid))
-    if r:
-        await db.x("DELETE FROM twins WHERE chat_id=? AND user_id=?", (m.chat.id, uid))
-        text = f"✅ {await user_link(uid)} больше не твин."
-    else:
-        await db.x("INSERT INTO twins(chat_id,user_id) VALUES(?,?)", (m.chat.id, uid))
-        text = f"👥 {await user_link(uid)} — твин: занимает место как отдельный игрок и стоит в списке ниже основных."
-    await m.reply(text)
-    await refresh_lists(bot, m.chat.id)
-    from economy import schedule_refresh
-    schedule_refresh(bot)
-
-
-@cmd(".твины", perm="lists")
-async def c_twins(m, args, bot):
-    rows = await db.q("SELECT user_id FROM twins WHERE chat_id=?", (m.chat.id,))
-    if not rows:
-        return await m.reply("Твинов нет.")
-    await m.reply("👥 <b>Твины:</b>\n" + "\n".join("• " + await user_link(r["user_id"]) for r in rows))
-
-
 async def _push(bot, chat, row, state):
     """Обновляет сообщение со списком (подпись или текст), кнопки пропадают у заполненного."""
     text = await full_text(chat, row, state)
@@ -257,7 +221,7 @@ async def _push(bot, chat, row, state):
 
 
 async def refresh_lists(bot, chat):
-    """Перерисовывает запущенные списки чата (например, после смены статуса твина)."""
+    """Перерисовывает запущенные списки чата."""
     for row in await db.q("SELECT * FROM lists WHERE chat_id=? AND msg_id IS NOT NULL", (chat,)):
         await _push(bot, chat, row, json.loads(row["state"]))
 
@@ -273,6 +237,22 @@ async def remove_from_lists(bot, chat, uid):
         st = {"captain": None if cap and cap["id"] == uid else cap, "players": pl}
         await db.x("UPDATE lists SET state=? WHERE chat_id=? AND num=?", (json.dumps(st), chat, row["num"]))
         await _push(bot, chat, row, st)
+    for r in await db.q("SELECT num, ids FROM done_lists WHERE chat_id=?", (chat,)):
+        ids = [i for i in json.loads(r["ids"]) if i != uid]
+        await db.x("UPDATE done_lists SET ids=? WHERE chat_id=? AND num=?", (json.dumps(ids), chat, r["num"]))
+
+
+async def list_ids(chat_id):
+    """Все, кто записан в списки чата: идущие сейчас + набранные, пока не прошла игра."""
+    ids = set()
+    for r in await db.q("SELECT state FROM lists WHERE chat_id=?", (chat_id,)):
+        st = json.loads(r["state"])
+        ids |= {p["id"] for p in st.get("players", [])}
+        if st.get("captain"):
+            ids.add(st["captain"]["id"])
+    for r in await db.q("SELECT ids FROM done_lists WHERE chat_id=? AND until>?", (chat_id, time.time())):
+        ids |= set(json.loads(r["ids"]))
+    return ids
 
 
 async def in_other_team_list(chat_id, uid):
@@ -280,14 +260,21 @@ async def in_other_team_list(chat_id, uid):
     if not key:
         return False
     other = config.TEAMS[config.other_team(key)]["chat_id"]
-    for r in await db.q("SELECT state FROM lists WHERE chat_id=?", (other,)):
-        st = json.loads(r["state"])
-        ids = {p["id"] for p in st.get("players", [])}
-        if st.get("captain"):
-            ids.add(st["captain"]["id"])
-        if uid in ids:
-            return True
-    return False
+    return bool(other) and uid in await list_ids(other)
+
+
+async def finish_list(chat, num, st):
+    """Список набран: запоминаем состав до конца игры и сбрасываем сам список (шаблон остаётся)."""
+    from games import FMT, now
+    ids = [p["id"] for p in st["players"]] + ([st["captain"]["id"]] if st.get("captain") else [])
+    g = await db.one("SELECT dt FROM games WHERE chat_id=? AND dt>=? ORDER BY dt LIMIT 1", (chat, now().strftime(FMT)))
+    if g:
+        until = (datetime.strptime(g["dt"], FMT) - now()).total_seconds() + 90 * 60 + time.time()
+    else:
+        until = time.time() + 12 * 3600
+    await db.x("INSERT OR REPLACE INTO done_lists(chat_id,num,ids,until) VALUES(?,?,?,?)",
+               (chat, num, json.dumps(ids), until))
+    await db.x("UPDATE lists SET state=?, msg_id=NULL WHERE chat_id=? AND num=?", (empty_state(), chat, num))
 
 
 async def _edit(call, text, kb):
@@ -360,7 +347,6 @@ async def on_cb(call, parts, bot):
                 return await call.answer(f"Без приставки встать в список нельзя. Добавьте в имя: {prefix}", show_alert=True)
             if await in_other_team_list(chat, u.id):
                 return await call.answer("Вы уже записаны в списке другой команды 🙅", show_alert=True)
-            is_twin = bool(await db.one("SELECT 1 FROM twins WHERE chat_id=? AND user_id=?", (chat, u.id)))
             if action == "like":
                 if in_pl or is_c:
                     return await call.answer("Вы уже в списке")
@@ -368,8 +354,6 @@ async def on_cb(call, parts, bot):
                     return await call.answer("Мест нет", show_alert=True)
                 players.append(me)
             else:
-                if is_twin:
-                    return await call.answer("Твин не может быть кэпом", show_alert=True)
                 if not has_cap(row["template"]):
                     return await call.answer("В списке нет места кэпа")
                 if cap and cap["id"] != u.id:
@@ -381,13 +365,16 @@ async def on_cb(call, parts, bot):
                     cap = me
         st = {"captain": cap, "players": players}
         await db.x("UPDATE lists SET state=? WHERE chat_id=? AND num=?", (json.dumps(st), chat, num))
+        full = is_full(row, st)
         try:
-            await _edit(call, await full_text(chat, row, st), None if is_full(row, st) else list_kb(num))
+            await _edit(call, await full_text(chat, row, st), None if full else list_kb(num))
         except TelegramBadRequest as e:
             if "too long" in str(e).lower():
                 await call.answer("Список не помещается в подпись к картинке", show_alert=True)
             else:
                 raise
+        if full:
+            await finish_list(chat, num, st)
         await call.answer()
     try:
         from sync import enforce_team

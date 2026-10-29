@@ -1,5 +1,7 @@
 import aiosqlite
 
+import config
+
 _db = None
 
 SCHEMA = """
@@ -28,7 +30,14 @@ CREATE TABLE IF NOT EXISTS warns(id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id I
 CREATE TABLE IF NOT EXISTS history(id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER, user_id INTEGER,
     action TEXT, reason TEXT, until REAL, created REAL, by_id INTEGER);
 CREATE TABLE IF NOT EXISTS caps(chat_id INTEGER, user_id INTEGER, perms TEXT, PRIMARY KEY(chat_id,user_id));
-CREATE TABLE IF NOT EXISTS twins(chat_id INTEGER, user_id INTEGER, PRIMARY KEY(chat_id,user_id));
+-- единый баланс: каждый закреплён за основной командой (home), баллы одни на всех
+CREATE TABLE IF NOT EXISTS bank(user_id INTEGER PRIMARY KEY, home TEXT NOT NULL, value REAL NOT NULL DEFAULT 0,
+    absent INTEGER NOT NULL DEFAULT 0);
+CREATE INDEX IF NOT EXISTS ix_bank_home ON bank(home);
+-- набранные списки: хранятся до конца игры, чтобы работали проверки (кик, запрет записи в две команды)
+CREATE TABLE IF NOT EXISTS done_lists(chat_id INTEGER, num INTEGER, ids TEXT, until REAL, PRIMARY KEY(chat_id,num));
+-- заявки, пришедшие во время закрытого входа (20:00-21:00), бот примет их после 21:00
+CREATE TABLE IF NOT EXISTS join_queue(chat_id INTEGER, user_id INTEGER, ts REAL, PRIMARY KEY(chat_id,user_id));
 """
 
 
@@ -40,12 +49,50 @@ async def init(path="bot.db"):
     for stmt in ("ALTER TABLE lists ADD COLUMN photo TEXT",
                  "ALTER TABLE poll_tpl ADD COLUMN once INTEGER DEFAULT 0",
                  "ALTER TABLE custom ADD COLUMN mtype TEXT",
-                 "ALTER TABLE custom ADD COLUMN fid TEXT"):  # миграция старых баз
+                 "ALTER TABLE custom ADD COLUMN fid TEXT",
+                 "ALTER TABLE custom ADD COLUMN mode TEXT DEFAULT 'start'"):  # миграция старых баз
         try:
             await _db.execute(stmt)
         except Exception:
             pass
     await _db.commit()
+    await migrate_bank()
+
+
+async def migrate_bank():
+    """Один раз: сливает баллы по командам (points) минус траты (spent) в единый баланс (bank).
+    Основная команда = чат, где человек состоит; если в обоих — где у него больше баллов,
+    затем та, чья приставка стоит в его имени, затем где он появился раньше."""
+    if await get_meta("bank_v1") == "1":
+        return
+    pts, mem, spent = {}, {}, {}
+    for r in await q("SELECT user_id,team,value,absent FROM points"):
+        pts.setdefault(r["user_id"], {})[r["team"]] = (r["value"], r["absent"])
+    for key, t in config.TEAMS.items():
+        if t["chat_id"]:
+            for r in await q("SELECT user_id, rowid AS rid FROM members WHERE chat_id=?", (t["chat_id"],)):
+                mem.setdefault(r["user_id"], {})[key] = r["rid"]
+    for r in await q("SELECT user_id,value FROM spent"):
+        spent[r["user_id"]] = r["value"]
+    names = {r["user_id"]: r["name"] or "" for r in await q("SELECT user_id,name FROM users")}
+    prefixes = {}
+    for key, t in config.TEAMS.items():
+        pf = await get_setting(t["chat_id"], "prefix", "") if t["chat_id"] else ""
+        prefixes[key] = "".join(pf.split()).lower()
+    for uid in set(pts) | set(mem):
+        p, m = pts.get(uid, {}), mem.get(uid, {})
+        cands = set(m) or set(p)
+        if not cands:
+            continue
+        nm = "".join(names.get(uid, "").split()).lower()
+        home = max(cands, key=lambda k: (p.get(k, (0, 0))[0], bool(prefixes.get(k)) and nm.startswith(prefixes[k]),
+                                         -m.get(k, 10 ** 12)))
+        value = sum(v for v, _ in p.values()) - spent.get(uid, 0)
+        absent = 0 if home in m else p.get(home, (0, 0))[1]
+        await _db.execute("INSERT OR REPLACE INTO bank(user_id,home,value,absent) VALUES(?,?,?,?)", (uid, home, value, absent))
+    await _db.execute("DROP TABLE IF EXISTS twins")
+    await _db.commit()
+    await set_meta("bank_v1", "1")
 
 
 async def q(sql, args=()):
@@ -116,6 +163,9 @@ async def add_member(chat_id, uid):
         return False
     _mem.add((chat_id, uid))
     cur = await _db.execute("INSERT OR IGNORE INTO members(chat_id,user_id) VALUES(?,?)", (chat_id, uid))
+    key = config.team_key(chat_id)
+    if key:  # первая команда, где человека увидели, становится его основной
+        await _db.execute("INSERT OR IGNORE INTO bank(user_id,home,value,absent) VALUES(?,?,0,0)", (uid, key))
     await _db.commit()
     return cur.rowcount > 0
 

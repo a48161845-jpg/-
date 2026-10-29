@@ -1,11 +1,13 @@
 import asyncio
 import json
+import re
 import time
 
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import InlineKeyboardButton as B
 from aiogram.types import InlineKeyboardMarkup as KB
 
+import custom
 import db
 from core import cb, cmd, esc, fmt, has_perm, mention, parse_num
 from games import KINDS, PALETTE
@@ -18,7 +20,7 @@ SIMPLE = {
     "prefix": ("str", "Отправьте новую приставку (например: Midnight |)"),
     "norm": ("num", "Отправьте норму баллов (число)"),
     "warn_limit": ("int", "Отправьте лимит варнов (число)"),
-    "kick_window": ("int", "За сколько минут до игры кикать из чата второй команды (число)"),
+    "kick_window": ("int", "За сколько минут до игры исключать из чата тех, кто состоит в другой команде и не записан в список (число)"),
     "tag_limit": ("int", "Сколько упоминаний в одном сообщении (число)"),
     "tag_delay": ("num", "Задержка между сообщениями с тегами, секунд (число)"),
 }
@@ -41,11 +43,26 @@ def grid(btns, n=2):
     return [btns[i:i + n] for i in range(0, len(btns), n)]
 
 
+MAIN_TEXT = """⚙️ <b>Настройки чата</b>
+
+Что есть в каждом разделе:
+
+💰 <b>Экономика</b> — норма баллов, приставка в имени, перевод баллов между участниками, лимит варнов, за сколько минут до игры бот исключает чужих, автоприём заявок.
+📅 <b>Календарь</b> — тип игры по умолчанию и цвета дней в картинке-календаре.
+📊 <b>Опросы</b> — канал для опросов, таймеры «за N часов до игры», шаблоны опросов, авто-режим и очередь.
+🏷 <b>Теги</b> — как бот зовёт всех командой <code>.тег</code>: сколько упоминаний в сообщении и пауза между ними.
+📝 <b>Тексты</b> — приветствие новичков, прощание и правила чата.
+🧩 <b>Команды</b> — свои команды-триггеры: слово или фраза → ответ (текст, фото, гиф, стикер…).
+
+Выберите раздел:"""
+
+
 async def main_screen(chat):
-    return "⚙️ <b>Настройки чата:</b>\n\nВыберите раздел:", kb(grid([
+    return MAIN_TEXT, kb(grid([
         B(text="💰 Экономика", callback_data="st:menu:eco"), B(text="📅 Календарь", callback_data="st:menu:cal"),
         B(text="📊 Опросы", callback_data="st:menu:polls"), B(text="🏷 Теги", callback_data="st:menu:tags"),
-        B(text="📝 Тексты", callback_data="st:menu:texts"), B(text="✖️ Закрыть", callback_data="st:close")]))
+        B(text="📝 Тексты", callback_data="st:menu:texts"), B(text="🧩 Команды", callback_data="st:menu:cmds"),
+        B(text="✖️ Закрыть", callback_data="st:close")]))
 
 
 async def eco_screen(chat):
@@ -55,7 +72,7 @@ async def eco_screen(chat):
          f"• Приставка: {esc(await S(chat, 'prefix', '—') or '—')}\n"
          f"• Перевод баллов: {onoff(tr)}\n"
          f"• Лимит варнов: {await S(chat, 'warn_limit', '3')}\n"
-         f"• Кик из чата 2-й команды за: {await S(chat, 'kick_window', '60')} мин до игры\n"
+         f"• Исключать чужих из чата за: {await S(chat, 'kick_window', '60')} мин до игры\n"
          f"• Заявки на вступление: {'авто-принятие ✅' if aa else 'вручную ❌'}")
     return t, kb(grid([
         B(text="✏️ Приставка", callback_data="st:ask:prefix"), B(text="✏️ Норма", callback_data="st:ask:norm"),
@@ -134,8 +151,33 @@ async def texts_screen(chat):
                      B(text="📜 Правила", callback_data="st:ask:text_rules"), B(text="⬅️ Назад", callback_data="st:menu:main")])))
 
 
+async def cmds_screen(chat):
+    items = sorted(await custom.rows(chat), key=lambda r: r["trig"])
+    t = ("🧩 <b>Свои команды</b>\n\nСлово или фраза → ответ бота. Регистр и префикс (. ! / ,) не важны.\n"
+         "Нажмите на команду, чтобы сменить режим или удалить; ➕ — создать новую.\n"
+         + ("\n" + "\n".join(f"• <code>{esc(r['trig'])}</code> · {custom.MODES[r['mode']]}" for r in items) if items else "\nПока пусто."))
+    btns = [B(text=r["trig"][:30], callback_data=f"st:cmdv:{r['rid']}") for r in items]
+    btns += [B(text="➕ Новая", callback_data="st:ask:cmd_new"), B(text="⬅️ Назад", callback_data="st:menu:main")]
+    return t, kb(grid(btns))
+
+
+async def cmd_screen(chat, rid):
+    r = await custom.by_rid(chat, rid)
+    if not r:
+        return await cmds_screen(chat)
+    body = esc(re.sub(r"<[^>]+>", "", r["text"])[:300]) or "—"
+    t = (f"🧩 <b>{esc(r['trig'])}</b>\nСрабатывает: <b>{custom.MODES[r['mode']]}</b>"
+         f"{' · ' + r['mtype'] if r['mtype'] else ''}\n\n{body}\n\n"
+         "<i>в начале — сообщение начинается с триггера (дальше аргументы) · точно — сообщение равно триггеру · "
+         "в тексте — триггер встречается в сообщении</i>")
+    return t, kb(grid([B(text=f"Режим: {custom.MODES[r['mode']]} ↻", callback_data=f"st:cmdm:{rid}"),
+                       B(text="🗑 Удалить", callback_data=f"st:cmdd:{rid}"),
+                       B(text="⬅️ Назад", callback_data="st:menu:cmds")]))
+
+
 SCREENS = {"main": main_screen, "eco": eco_screen, "cal": cal_screen, "polls": polls_screen,
-           "tags": tags_screen, "texts": texts_screen}
+           "tags": tags_screen, "texts": texts_screen, "cmds": cmds_screen}
+
 
 
 @cmd(".настройки", "/settings", perm="settings")
@@ -179,6 +221,17 @@ async def on_cb(call, parts, bot):
         cur = await S(chat, f"col_{parts[2]}", "Стандарт")
         await db.set_setting(chat, f"col_{parts[2]}", names[(names.index(cur) + 1) % len(names)])
         await _show(call, await cal_screen(chat))
+    elif a == "cmdv":
+        await _show(call, await cmd_screen(chat, int(parts[2])))
+    elif a == "cmdm":
+        r = await custom.by_rid(chat, int(parts[2]))
+        if r:
+            order = custom.MODE_ORDER
+            await custom.set_mode(chat, r["rid"], order[(order.index(r["mode"]) + 1) % len(order)])
+        await _show(call, await cmd_screen(chat, int(parts[2])))
+    elif a == "cmdd":
+        await custom.delete(chat, int(parts[2]))
+        await _show(call, await cmds_screen(chat))
     elif a == "tpls":
         await _show(call, await tpls_screen(chat))
     elif a == "tpl":
@@ -220,7 +273,8 @@ async def on_cb(call, parts, bot):
             "timer_add": "За сколько часов до игры слать опрос? (число, например 10 или 1,5)",
             "text_greet": "Отправьте текст приветствия ({name} — имя участника).",
             "text_bye": "Отправьте текст прощания ({name} — имя участника).",
-            "text_rules": "Отправьте текст правил."})
+            "text_rules": "Отправьте текст правил.",
+            "cmd_new": "Отправьте триггер — слово или фразу, на которую бот будет отвечать (например: гайд или кто тут)."})
         PENDING[(chat, uid)] = (action, arg, time.time())
         await call.message.answer(f"✍️ {hints.get(action, 'Отправьте значение')}\n<i>Для отмены напишите: отмена</i>")
     await call.answer()
@@ -236,10 +290,32 @@ async def handle_pending(m):
         PENDING.pop(key, None)
         return False
     text = (m.text or m.caption or "").strip()
+    mtype, fid = custom.media_of(m)
+    if not text and not (action == "cmd_text" and mtype):
+        return False
     PENDING.pop(key, None)
     chat = m.chat.id
     if text.lower() in ("отмена", "cancel"):
         await m.reply("Отменено.")
+        return True
+    if action == "cmd_new":
+        trig = custom.norm_trig(text)
+        err = custom.check_trigger(trig)
+        if err:
+            await m.reply(f"❗ {err} Откройте .настройки → Команды и попробуйте снова.")
+        else:
+            PENDING[key] = ("cmd_text", trig, time.time())
+            await m.reply(f"✍️ Теперь отправьте ответ для <code>{esc(trig)}</code>: текст, фото, гиф, стикер, файл…\n"
+                          "В тексте можно {name}, {args}, {имя_фамилия}.\n<i>Для отмены напишите: отмена</i>")
+        return True
+    if action == "cmd_text":
+        body = m.html_text if (m.text or m.caption) else ""
+        if mtype in ("sticker", "video_note"):
+            body = ""
+        await custom.save(chat, arg, body or "", mtype, fid, "start")
+        rid = next((r["rid"] for r in await custom.rows(chat) if r["trig"] == arg), 0)
+        t, k = await cmd_screen(chat, rid)
+        await m.answer("✅ Команда сохранена.\n\n" + t, reply_markup=k)
         return True
     if action in SIMPLE:
         typ = SIMPLE[action][0]

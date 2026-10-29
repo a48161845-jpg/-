@@ -16,7 +16,12 @@ API_HASH = os.getenv("API_HASH", "")
 
 TZ_NAME = os.getenv("TZ_NAME", "Europe/Moscow")
 TZ_OFFSET_HOURS = int(os.getenv("TZ_OFFSET_HOURS", "3"))  # запасной вариант без tzdata
-DAILY_CHECK_HOUR =int(os.getenv("DAILY_CHECK_HOUR", "4"))
+# Ежедневная синхронизация участников — в 00:00 по МСК
+DAILY_CHECK_HOUR = 0
+
+# Голодные игры: с 20:00 до 21:00 (МСК) заход в команды закрыт, после 21:00 бот принимает заявки
+JOIN_CLOSE_FROM = 20 * 60
+JOIN_CLOSE_TO = 21 * 60
 
 TEAMS = {
     "starlight": {

@@ -5,7 +5,7 @@ from datetime import timedelta
 from aiogram.types import ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup
 
 import db
-from core import (PERMS, cb, cmd, esc, fmt_dur, get_caps, is_creator, is_owner, mention,
+from core import (FLAGS, PERMS, cb, cmd, esc, fmt_dur, get_caps, is_creator, is_owner, mention,
                   parse_duration, resolve_target, user_link, user_name)
 
 FULL = ChatPermissions(
@@ -212,14 +212,15 @@ async def c_caps(m, args, bot):
     lines = ["👑 <b>Кэпы:</b>"]
     for r in rows:
         perms = json.loads(r["perms"])
-        lines.append(f"• {await user_link(r['user_id'])}: " + ", ".join(PERMS[p] for p in perms if p in PERMS))
+        labels = {**PERMS, **FLAGS}
+        lines.append(f"• {await user_link(r['user_id'])}: " + ", ".join(labels[p] for p in perms if p in labels))
     await m.reply("\n".join(lines))
 
 
 async def _perm_kb(chat, uid):
     caps = await get_caps(chat, uid) or set()
     btns = [InlineKeyboardButton(text=("✅ " if p in caps else "❌ ") + t, callback_data=f"cp:t:{uid}:{p}")
-            for p, t in PERMS.items()]
+            for p, t in {**PERMS, **FLAGS}.items()]
     rows = [btns[i:i + 2] for i in range(0, len(btns), 2)]
     rows.append([InlineKeyboardButton(text="💾 Готово", callback_data="cp:ok")])
     return InlineKeyboardMarkup(inline_keyboard=rows)

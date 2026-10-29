@@ -52,7 +52,10 @@ async def on_message(m: Message, bot: Bot):
             await m.answer(t.replace("{name}", mention(u.id, u.full_name)))
 
     text = m.text or m.caption
-    if not text or not m.from_user:
+    if not m.from_user:
+        return
+    if not text:
+        await settings.handle_pending(m)  # медиа-ответ при создании своей команды
         return
     token = text.split(None, 1)[0].lower()
     if token.startswith("/"):
@@ -60,9 +63,9 @@ async def on_message(m: Message, bot: Bot):
     # команда должна начинаться с префикса (. ! / ,) либо с + или -
     entry = REG.get(canon(token)) if token[0] in PREFIXES + "+-" else None
     if not entry:
-        if await custom.run_custom(m, text, bot):
+        if await settings.handle_pending(m):  # ждём ответ на вопрос из настроек — он важнее триггеров
             return
-        await settings.handle_pending(m)
+        await custom.run_custom(m, text, bot)
         return
     settings.PENDING.pop((m.chat.id, m.from_user.id), None)
     fn, perm = entry

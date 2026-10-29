@@ -64,6 +64,6 @@ async def sync_chat(chat_id):
             await db.add_member(chat_id, u.id)
             n += 1
     except Exception as e:
-        # чаще всего: чат ещё не «виден» клиенту — напишите в нём любое сообщение/команду и повторите .синхр
+        # чаще всего: чат ещё не «виден» клиенту — напишите в нём любое сообщение — повтор будет при ежедневной синхронизации в 00:00 МСК
         log.warning("sync_chat %s failed: %s", chat_id, e)
     return n

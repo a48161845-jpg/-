@@ -40,31 +40,28 @@ def parse_grant_lines(text):
     return ok, bad
 
 
-async def add_points(uid, team, delta):
+async def add_points(uid, delta, home):
+    """Единый баланс. home — команда, в чьём чате идёт выдача (используется только если человека ещё нет в базе)."""
     await db.x(
-        "INSERT INTO points(user_id,team,value,absent) VALUES(?,?,?,0) "
-        "ON CONFLICT(user_id,team) DO UPDATE SET value=value+excluded.value",
-        (uid, team, delta),
+        "INSERT INTO bank(user_id,home,value,absent) VALUES(?,?,?,0) "
+        "ON CONFLICT(user_id) DO UPDATE SET value=value+excluded.value",
+        (uid, home, delta),
     )
 
 
-async def get_points(uid, team):
-    """Заработано в команде (для списка в канале и нормы)."""
-    r = await db.one("SELECT value FROM points WHERE user_id=? AND team=?", (uid, team))
+async def get_balance(uid):
+    r = await db.one("SELECT value FROM bank WHERE user_id=?", (uid,))
     return r["value"] if r else 0.0
 
 
-async def get_total(uid):
-    """Баланс для трат: заработано в обеих командах минус потрачено."""
-    e = await db.one("SELECT COALESCE(SUM(value),0) v FROM points WHERE user_id=?", (uid,))
-    s = await db.one("SELECT value FROM spent WHERE user_id=?", (uid,))
-    return (e["v"] if e else 0.0) - (s["value"] if s else 0.0)
+async def get_home(uid):
+    """Основная команда человека (где он был изначально) или None."""
+    r = await db.one("SELECT home FROM bank WHERE user_id=?", (uid,))
+    return r["home"] if r else None
 
 
-async def spend_points(uid, team, amount):
-    """Траты не трогают заработанное по командам — список в канале показывает, где человек играет."""
-    await db.x("INSERT INTO spent(user_id,value) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET value=value+excluded.value",
-               (uid, amount))
+async def spend_points(uid, amount):
+    await db.x("UPDATE bank SET value=value-? WHERE user_id=?", (amount, uid))
 
 
 def _clip(text, n=32):
@@ -73,24 +70,20 @@ def _clip(text, n=32):
 
 
 async def build_blocks():
-    """[(команда, [строки])] — участники чата + все, у кого есть баллы; твины помечены."""
+    """[(команда, [строки])] — все, кто закреплён за командой (основная команда), по убыванию баланса."""
     blocks = []
     for key, t in config.TEAMS.items():
         cid = t["chat_id"]
         rows = await db.q(
-            "SELECT i.user_id AS user_id, u.name AS name, u.username AS username, "
-            "COALESCE(p.value,0) AS value, COALESCE(p.absent,0) AS absent, "
-            "(SELECT 1 FROM twins w WHERE w.chat_id=? AND w.user_id=i.user_id) AS twin "
-            "FROM (SELECT user_id FROM members WHERE chat_id=? UNION SELECT user_id FROM points WHERE team=?) i "
-            "LEFT JOIN users u ON u.user_id=i.user_id "
-            "LEFT JOIN points p ON p.user_id=i.user_id AND p.team=? "
-            "ORDER BY absent ASC, value DESC, u.name COLLATE NOCASE ASC", (cid, cid, key, key))
+            "SELECT b.user_id AS user_id, u.name AS name, u.username AS username, b.value AS value, b.absent AS absent "
+            "FROM bank b LEFT JOIN users u ON u.user_id=b.user_id WHERE b.home=? "
+            "ORDER BY b.absent ASC, b.value DESC, u.name COLLATE NOCASE ASC", (key,))
         norm = await get_norm(cid) if cid else 0
         lines = [f"{t['title']} — {len(rows)}" + (f" · норма {fmt(norm)}" if norm else ""), ""]
         for i, r in enumerate(rows, 1):
             un = f"@{r['username']}" if r["username"] else "—"
             line = f"{i}. {_clip(r['name'])} | {un} | {r['user_id']} - {fmt(r['value'])}"
-            line += (" 👥" if r["twin"] else "") + (" 🚪" if r["absent"] else "")
+            line += " 🚪" if r["absent"] else ""
             lines.append(line)
         blocks.append((key, lines))
     return blocks
@@ -201,15 +194,16 @@ async def c_points(m, args, bot):
         if args.strip():
             return await m.reply("Пользователь не найден (он должен хотя бы раз написать в чате).")
         uid = m.from_user.id
-    lines = [f"💰 {await user_link(uid)}"]
-    for key, t in config.TEAMS.items():
-        val = await get_points(uid, key)
-        line = f"{t['title']}: <b>{fmt(val)}</b>"
+    bal = await get_balance(uid)
+    home = await get_home(uid)
+    lines = [f"💰 {await user_link(uid)}", f"Баланс: <b>{fmt(bal)}</b>"]
+    if home in config.TEAMS:
+        t = config.TEAMS[home]
+        line = f"Команда: {t['title']}"
         norm = await get_norm(t["chat_id"]) if t["chat_id"] else 0
         if norm:
-            line += f" · норма {fmt(norm)} {'✅' if val >= norm else '❌'}"
+            line += f" · норма {fmt(norm)} {'✅' if bal >= norm else '❌'}"
         lines.append(line)
-    lines.append(f"\n💳 Баланс для трат: <b>{fmt(await get_total(uid))}</b>")
     await m.reply("\n".join(lines))
 
 
@@ -228,7 +222,7 @@ async def c_grant_list(m, args, bot):
         if uid is None:
             missing.append(tok)
             continue
-        await add_points(uid, key, val)
+        await add_points(uid, val, key)
         done.append(f"{await user_name(uid)} ({uid}): {'+' if val > 0 else ''}{fmt(val)}")
     await refresh_channel(bot)
     if done:
@@ -241,7 +235,7 @@ async def c_grant_list(m, args, bot):
     text = f"✅ Начислено: {len(done)}"
     if missing:
         text += ("\n⚠️ Не найдены: " + ", ".join(esc(x) for x in missing)
-                 + "\nПроверьте ник или выполните .синхр (нужен Telethon, чтобы бот видел всех участников).")
+                 + "\nПроверьте ник — бот обновляет участников каждый день в 00:00 МСК (для поиска по @нику нужен Telethon).")
     if bad:
         text += "\n⚠️ Не распознаны строки: " + "; ".join(esc(x) for x in bad[:10])
     await m.reply(text)
@@ -255,10 +249,10 @@ async def _plus_minus(m, args, bot, sign):
     amount = parse_num(rest.split()[0]) if rest.split() else None
     if uid is None or amount is None:
         return await m.reply("Формат: <code>+баллы @username 5</code>, <code>+баллы ID 1,5</code> или ответом: <code>+баллы 5</code>")
-    await add_points(uid, key, sign * abs(amount))
+    await add_points(uid, sign * abs(amount), key)
     await refresh_channel(bot)
     await m.reply(f"{'➕' if sign > 0 else '➖'} {await user_link(uid)}: {'+' if sign > 0 else '-'}{fmt(abs(amount))}. "
-                  f"Сейчас: <b>{fmt(await get_points(uid, key))}</b>")
+                  f"Баланс: <b>{fmt(await get_balance(uid))}</b>")
 
 
 @cmd("+баллы", perm="economy")
@@ -276,7 +270,7 @@ async def c_reset(m, args, bot):
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="✅ Да, сбросить", callback_data="eco:reset:y"),
         InlineKeyboardButton(text="Отмена", callback_data="eco:reset:n")]])
-    await m.reply("⚠️ Обнулить баллы <b>обеих команд</b> и траты?", reply_markup=kb)
+    await m.reply("⚠️ Обнулить баланс <b>всех участников</b>?", reply_markup=kb)
 
 
 @cb("eco")
@@ -285,10 +279,9 @@ async def on_cb(call, parts, bot):
         if not await has_perm(call.message.chat.id, call.from_user.id, "economy"):
             return await call.answer("Нет прав", show_alert=True)
         if parts[2] == "y":
-            await db.x("UPDATE points SET value=0")
-            await db.x("DELETE FROM spent")
+            await db.x("UPDATE bank SET value=0")
             await refresh_channel(bot)
-            await call.message.edit_text("🧹 Баллы обеих команд сброшены.")
+            await call.message.edit_text("🧹 Баллы сброшены.")
         else:
             await call.message.edit_text("Сброс отменён.")
         await call.answer()
@@ -335,9 +328,9 @@ async def c_transfer(m, args, bot):
     amount = parse_num(rest.split()[0]) if rest.split() else None
     if uid is None or not amount or amount <= 0 or uid == m.from_user.id:
         return await m.reply("Формат: <code>.передать @username 3</code>")
-    if await get_total(m.from_user.id) < amount:
+    if await get_balance(m.from_user.id) < amount:
         return await m.reply("Недостаточно баллов.")
-    await spend_points(m.from_user.id, key, amount)
-    await add_points(uid, key, amount)
+    await spend_points(m.from_user.id, amount)
+    await add_points(uid, amount, key)
     await refresh_channel(bot)
     await m.reply(f"🔁 {mention(m.from_user.id, m.from_user.full_name)} → {await user_link(uid)}: {fmt(amount)}")
