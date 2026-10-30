@@ -22,7 +22,7 @@ async def window_active(chat_id):
     n = now()
     for g in await db.q("SELECT dt FROM games WHERE chat_id=?", (chat_id,)):
         left = (datetime.strptime(g["dt"], FMT) - n).total_seconds()
-        if -90 * 60 <= left <= window:
+        if -60 * 60 <= left <= window:
             return True
     return False
 
