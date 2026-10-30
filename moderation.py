@@ -26,7 +26,7 @@ async def _parse(m, args, bot, with_dur=True):
         await m.reply("Укажите цель: ответом на сообщение, @ником или ID.")
         return None
     if is_owner(uid) or uid == bot.id:
-        await m.reply("Этого пользователя трогать нельзя.")
+        await m.reply("Создателя и бота трогать нельзя 😎")
         return None
     dur = None
     if with_dur:

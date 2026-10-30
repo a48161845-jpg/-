@@ -7,6 +7,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import InlineKeyboardButton as B
 from aiogram.types import InlineKeyboardMarkup as KB
 
+import config
 import custom
 import db
 from core import cb, cmd, esc, fmt, has_perm, mention, parse_num
@@ -437,7 +438,7 @@ async def c_tag(m, args, bot):
     limit = max(int(float(await S(m.chat.id, "tag_limit", "5"))), 1)
     delay = float(await S(m.chat.id, "tag_delay", "2"))
     rows = await db.q("SELECT m.user_id, u.name FROM members m LEFT JOIN users u ON u.user_id=m.user_id WHERE m.chat_id=?", (m.chat.id,))
-    people = [r for r in rows if r["user_id"] != bot.id]
+    people = [r for r in rows if r["user_id"] != bot.id and r["user_id"] not in config.OWNER_IDS]
     if not people:
         return await m.reply("Пока никого не знаю в этом чате.")
     text = esc(args or "Общий сбор!")

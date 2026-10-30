@@ -83,7 +83,7 @@ async def _shop_tags(chat_id):
     """Кого тегать при ручной выдаче: только кэпов с включённым «Тег при выдаче» в правах."""
     out = []
     for c in await db.q("SELECT user_id, perms FROM caps WHERE chat_id=?", (chat_id,)):
-        if "shoptag" in json.loads(c["perms"]):
+        if "shoptag" in json.loads(c["perms"]) and c["user_id"] not in config.OWNER_IDS:
             out.append(mention(c["user_id"], await user_name(c["user_id"])))
     return out
 

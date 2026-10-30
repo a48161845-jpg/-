@@ -71,7 +71,7 @@ def has_cap(tpl):
 
 
 def label(u, mode):
-    if mode == "username" and u.get("username"):
+    if mode == "username" and u.get("username") and u["id"] not in config.OWNER_IDS:
         return "@" + u["username"]
     return mention(u["id"], u["name"])
 
@@ -251,8 +251,8 @@ async def enforce_prefix(bot, chat):
     for row in await db.q("SELECT * FROM lists WHERE chat_id=? AND msg_id IS NOT NULL", (chat,)):
         st = json.loads(row["state"])
         cap = st.get("captain")
-        pl = [p for p in st["players"] if _has_prefix(p["name"], prefix)]
-        new_cap = cap if cap and _has_prefix(cap["name"], prefix) else None
+        pl = [p for p in st["players"] if p["id"] in config.OWNER_IDS or _has_prefix(p["name"], prefix)]
+        new_cap = cap if cap and (cap["id"] in config.OWNER_IDS or _has_prefix(cap["name"], prefix)) else None
         n = len(st["players"]) - len(pl) + (1 if cap and not new_cap else 0)
         if not n:
             continue
@@ -365,7 +365,7 @@ async def on_cb(call, parts, bot):
                 cap = None
         else:
             prefix = (await db.get_setting(chat, "prefix", "")).strip()
-            if prefix and not _has_prefix(u.full_name, prefix):
+            if prefix and u.id not in config.OWNER_IDS and not _has_prefix(u.full_name, prefix):
                 return await call.answer(f"Без приставки встать в список нельзя. Добавьте в имя: {prefix}", show_alert=True)
             if await in_other_team_list(chat, u.id):
                 return await call.answer("Вы уже записаны в списке другой команды 🙅", show_alert=True)

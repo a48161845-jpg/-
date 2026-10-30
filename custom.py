@@ -50,9 +50,9 @@ async def _vars(m, args):
     v = {
         "args": args.strip(), "текст": args.strip(),
         "name": u.full_name, "имя": first, "first": first, "last": last, "фамилия": last,
-        "username": f"@{u.username}" if u.username else u.full_name, "id": str(u.id),
+        "username": f"@{u.username}" if u.username and u.id not in config.OWNER_IDS else u.full_name, "id": str(u.id),
         "mention": mention(u.id, u.full_name),
-        "reply": r.full_name if r else "", "reply_username": (f"@{r.username}" if r.username else r.full_name) if r else "",
+        "reply": r.full_name if r else "", "reply_username": (f"@{r.username}" if r.username and r.id not in config.OWNER_IDS else r.full_name) if r else "",
         "replyid": str(r.id) if r else "", "replymention": mention(r.id, r.full_name) if r else "",
         "points": bal, "total": bal, "баллы": bal,
         "team": config.TEAMS[home]["title"] if home in config.TEAMS else "", "chat": m.chat.title or "",

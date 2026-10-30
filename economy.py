@@ -81,7 +81,7 @@ async def build_blocks():
         norm = await get_norm(cid) if cid else 0
         lines = [f"{t['title']} — {len(rows)}" + (f" · норма {fmt(norm)}" if norm else ""), ""]
         for i, r in enumerate(rows, 1):
-            un = f"@{r['username']}" if r["username"] else "—"
+            un = f"@{r['username']}" if r["username"] and r["user_id"] not in config.OWNER_IDS else "—"
             line = f"{i}. {_clip(r['name'])} | {un} | {r['user_id']} - {fmt(r['value'])}"
             line += " 🚪" if r["absent"] else ""
             lines.append(line)

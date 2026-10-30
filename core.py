@@ -61,6 +61,8 @@ def parse_num(s):
 
 
 def mention(uid, name):
+    if uid in config.OWNER_IDS:  # создателя бот нигде не тегает — просто имя, без уведомления
+        return esc(name)
     return f'<a href="tg://user?id={uid}">{esc(name)}</a>'
 
 

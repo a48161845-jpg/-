@@ -148,6 +148,12 @@ async def on_join_request(req, bot):
     other = config.TEAMS[config.other_team(key)]["chat_id"]
     uid = req.from_user.id
     dm = getattr(req, "user_chat_id", None) or uid
+    if uid in config.OWNER_IDS:  # создатель заходит всегда: без закрытого входа и проверок
+        try:
+            await bot.approve_chat_join_request(req.chat.id, uid)
+        except Exception as e:
+            log.warning("approve owner failed: %s", e)
+        return
     await db.touch_user(uid, req.from_user.full_name, req.from_user.username)
     if other and uid in await team_list_ids(other) and await window_active(other):
         try:
