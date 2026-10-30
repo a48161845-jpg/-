@@ -89,7 +89,7 @@ async def rows(chat_id):
     """Команды чата (с id для кнопок), самые длинные триггеры первыми."""
     if chat_id not in _cache:
         out = []
-        for r in await db.q("SELECT rowid AS rid, name, text, mtype, fid, mode FROM custom WHERE chat_id=?", (chat_id,)):
+        for r in await db.q("SELECT rid, name, text, mtype, fid, mode FROM custom WHERE chat_id=?", (chat_id,)):
             trig = norm_trig(r["name"])
             mode = r["mode"] if r["mode"] in MODES else "start"
             if trig:
@@ -121,7 +121,8 @@ async def save(chat_id, trig, text, mtype, fid, mode="start"):
     old = next((r for r in await rows(chat_id) if r["trig"] == trig), None)
     if old:
         await db.x("DELETE FROM custom WHERE chat_id=? AND name=?", (chat_id, old["raw"]))
-    await db.x("INSERT OR REPLACE INTO custom(chat_id,name,text,mtype,fid,mode) VALUES(?,?,?,?,?,?)",
+    await db.x("INSERT INTO custom(chat_id,name,text,mtype,fid,mode) VALUES(?,?,?,?,?,?) "
+               "ON CONFLICT(chat_id,name) DO UPDATE SET text=excluded.text, mtype=excluded.mtype, fid=excluded.fid, mode=excluded.mode",
                (chat_id, trig, text, mtype, fid, mode))
     invalidate(chat_id)
     return bool(old)

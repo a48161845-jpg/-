@@ -242,6 +242,27 @@ async def remove_from_lists(bot, chat, uid):
         await db.x("UPDATE done_lists SET ids=? WHERE chat_id=? AND num=?", (json.dumps(ids), chat, r["num"]))
 
 
+async def enforce_prefix(bot, chat):
+    """Применяет приставку чата к уже запущенным спискам. Возвращает число убранных людей."""
+    prefix = (await db.get_setting(chat, "prefix", "")).strip()
+    if not prefix:
+        return 0
+    removed = 0
+    for row in await db.q("SELECT * FROM lists WHERE chat_id=? AND msg_id IS NOT NULL", (chat,)):
+        st = json.loads(row["state"])
+        cap = st.get("captain")
+        pl = [p for p in st["players"] if _has_prefix(p["name"], prefix)]
+        new_cap = cap if cap and _has_prefix(cap["name"], prefix) else None
+        n = len(st["players"]) - len(pl) + (1 if cap and not new_cap else 0)
+        if not n:
+            continue
+        removed += n
+        st = {"captain": new_cap, "players": pl}
+        await db.x("UPDATE lists SET state=? WHERE chat_id=? AND num=?", (json.dumps(st), chat, row["num"]))
+        await _push(bot, chat, row, st)
+    return removed
+
+
 async def list_ids(chat_id):
     """Все, кто записан в списки чата: идущие сейчас + набранные, пока не прошла игра."""
     ids = set()
@@ -272,7 +293,8 @@ async def finish_list(chat, num, st):
         until = (datetime.strptime(g["dt"], FMT) - now()).total_seconds() + 90 * 60 + time.time()
     else:
         until = time.time() + 12 * 3600
-    await db.x("INSERT OR REPLACE INTO done_lists(chat_id,num,ids,until) VALUES(?,?,?,?)",
+    await db.x("INSERT INTO done_lists(chat_id,num,ids,until) VALUES(?,?,?,?) "
+               "ON CONFLICT(chat_id,num) DO UPDATE SET ids=excluded.ids, until=excluded.until",
                (chat, num, json.dumps(ids), until))
     await db.x("UPDATE lists SET state=?, msg_id=NULL WHERE chat_id=? AND num=?", (empty_state(), chat, num))
 

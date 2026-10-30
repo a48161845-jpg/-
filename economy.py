@@ -44,7 +44,7 @@ async def add_points(uid, delta, home):
     """Единый баланс. home — команда, в чьём чате идёт выдача (используется только если человека ещё нет в базе)."""
     await db.x(
         "INSERT INTO bank(user_id,home,value,absent) VALUES(?,?,?,0) "
-        "ON CONFLICT(user_id) DO UPDATE SET value=value+excluded.value",
+        "ON CONFLICT(user_id) DO UPDATE SET value=bank.value+excluded.value",
         (uid, home, delta),
     )
 
@@ -77,7 +77,7 @@ async def build_blocks():
         rows = await db.q(
             "SELECT b.user_id AS user_id, u.name AS name, u.username AS username, b.value AS value, b.absent AS absent "
             "FROM bank b LEFT JOIN users u ON u.user_id=b.user_id WHERE b.home=? "
-            "ORDER BY b.absent ASC, b.value DESC, u.name COLLATE NOCASE ASC", (key,))
+            "ORDER BY b.absent ASC, b.value DESC, LOWER(u.name) ASC", (key,))
         norm = await get_norm(cid) if cid else 0
         lines = [f"{t['title']} — {len(rows)}" + (f" · норма {fmt(norm)}" if norm else ""), ""]
         for i, r in enumerate(rows, 1):

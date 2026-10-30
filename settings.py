@@ -97,17 +97,21 @@ async def cal_screen(chat):
 async def polls_screen(chat):
     ch = await S(chat, "poll_channel", "")
     auto, queue = await S(chat, "auto_polls", "1") == "1", await S(chat, "queue", "0") == "1"
+    pin = await S(chat, "auto_pin", "1") == "1"
     t = (f"📢 <b>Канал и опросы</b>\n\n• Привязанный канал: {ch or 'не привязан'}\n• Авто-опросы: {onoff(auto)}\n"
-         f"• Режим очереди: {onoff(queue)}\n\nОпросы шлются за N часов до игры по таймерам.")
+         f"• Режим очереди: {onoff(queue)}\n• Автозакреп опросов: {onoff(pin)}\n\n"
+         "Опросы шлются за N часов до игры по таймерам. С автозакрепом бот закрепляет каждый отправленный опрос "
+         "(ему нужно право закреплять сообщения). Опрос на приз <code>.приз</code> закрепляется всегда.")
     return t, kb(grid([
         B(text="🔗 Канал", callback_data="st:ask:poll_channel"), B(text="⏰ Таймеры", callback_data="st:timers"),
         B(text="📝 Шаблоны", callback_data="st:tpls"), B(text=f"Авто: {'✅' if auto else '❌'}", callback_data="st:tog:auto_polls"),
         B(text=f"Очередь: {'✅' if queue else '❌'}", callback_data="st:tog:queue"),
+        B(text=f"📌 Закреп: {'✅' if pin else '❌'}", callback_data="st:tog:auto_pin"),
         B(text="⬅️ Назад", callback_data="st:menu:main")]))
 
 
 async def tpls_screen(chat):
-    rows = await db.q("SELECT name FROM poll_tpl WHERE chat_id=? ORDER BY rowid", (chat,))
+    rows = await db.q("SELECT name FROM poll_tpl WHERE chat_id=? ORDER BY id", (chat,))
     btns = [B(text=r["name"], callback_data=f"st:tpl:{r['name']}") for r in rows]
     btns += [B(text="➕ Новый", callback_data="st:ask:tpl_new"), B(text="⬅️ Назад", callback_data="st:menu:polls")]
     return "📝 <b>Редактор шаблонов:</b>\nВыберите шаблон для изменения:", kb(grid(btns))
@@ -208,9 +212,9 @@ async def on_cb(call, parts, bot):
         await _show(call, await SCREENS[parts[2]](chat))
     elif a == "tog":
         key = parts[2]
-        dflt = "1" if key in ("auto_polls", "auto_approve") else "0"
+        dflt = "1" if key in ("auto_polls", "auto_approve", "auto_pin") else "0"
         await db.set_setting(chat, key, "0" if await S(chat, key, dflt) == "1" else "1")
-        await _show(call, await (polls_screen if key in ("auto_polls", "queue") else eco_screen)(chat))
+        await _show(call, await (polls_screen if key in ("auto_polls", "queue", "auto_pin") else eco_screen)(chat))
     elif a == "kind":
         order = list(KINDS)
         cur = await S(chat, "game_kind", "simple")
@@ -327,7 +331,7 @@ async def handle_pending(m):
                 return True
             val = int(n) if typ == "int" else n
         await db.set_setting(chat, action, val)
-        await m.reply("✅ Сохранено.")
+        await m.reply("✅ Сохранено." + (await _apply_prefix(m.bot, chat) if action == "prefix" else ""))
     elif action == "poll_channel":
         cid = None
         fo = getattr(m, "forward_origin", None)
@@ -444,6 +448,14 @@ async def c_tag(m, args, bot):
 
 
 # ---------- приставка ----------
+async def _apply_prefix(bot, chat):
+    """Новая приставка сразу действует на уже отправленные списки: у кого её нет в имени — убираются."""
+    from lists import enforce_prefix
+    removed = await enforce_prefix(bot, chat)
+    return f"\n🔄 Уже отправленные списки обновлены, убраны без приставки: {removed}" if removed else ""
+
+
+
 @cmd(".приставка")
 async def c_prefix(m, args, bot):
     a = (args or "").strip()
@@ -458,7 +470,8 @@ async def c_prefix(m, args, bot):
         await db.del_setting(m.chat.id, "prefix")
         return await m.reply("🗑 Приставка снята — ограничение на вход в список выключено.")
     await db.set_setting(m.chat.id, "prefix", a[:30])
-    await m.reply(f"✅ Приставка: <b>{esc(a[:30])}</b>\nТеперь в список встанут только те, чьё имя в Telegram начинается с неё.")
+    await m.reply(f"✅ Приставка: <b>{esc(a[:30])}</b>\nТеперь в список встанут только те, чьё имя в Telegram начинается с неё."
+                  + await _apply_prefix(bot, m.chat.id))
 
 
 @cmd("-приставка", perm="settings")

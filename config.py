@@ -14,6 +14,9 @@ POINTS_CHANNEL_LINK = os.getenv("POINTS_CHANNEL_LINK", "")
 API_ID = int(os.getenv("API_ID", "0") or 0)
 API_HASH = os.getenv("API_HASH", "")
 
+# Онлайн-база PostgreSQL, например postgresql://user:password@host:5432/dbname?sslmode=require
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+
 TZ_NAME = os.getenv("TZ_NAME", "Europe/Moscow")
 TZ_OFFSET_HOURS = int(os.getenv("TZ_OFFSET_HOURS", "3"))  # запасной вариант без tzdata
 # Ежедневная синхронизация участников — в 00:00 по МСК

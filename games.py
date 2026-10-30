@@ -333,7 +333,18 @@ async def send_template(bot, chat_id, tpl, game=None):
         kw.update(type="quiz", correct_option_id=min(tpl["correct"], len(options) - 1))
     else:
         kw.update(allows_multiple_answers=bool(tpl["multi"]))
-    return await bot.send_poll(target, question, options, **kw)
+    msg = await bot.send_poll(target, question, options, **kw)
+    if await db.get_setting(chat_id, "auto_pin", "1") == "1":
+        await pin(bot, target, msg.message_id)
+    return msg
+
+
+async def pin(bot, chat_id, message_id):
+    """Закрепляет сообщение; если у бота нет права закреплять — молча пропускает."""
+    try:
+        await bot.pin_chat_message(chat_id, message_id)
+    except Exception:
+        pass
 
 
 @cmd(".опрос", perm="games")
@@ -355,7 +366,7 @@ async def run_auto_polls(bot):
         if await db.get_setting(chat, "auto_polls", "1") != "1":
             continue
         timers = sorted({float(x) for x in (await db.get_setting(chat, "timers", "")).split(",") if x.strip()}, reverse=True)
-        tpls = await db.q("SELECT * FROM poll_tpl WHERE chat_id=? ORDER BY rowid", (chat,))
+        tpls = await db.q("SELECT * FROM poll_tpl WHERE chat_id=? ORDER BY id", (chat,))
         if not timers or not tpls:
             continue
         queue = await db.get_setting(chat, "queue", "0") == "1"
@@ -380,7 +391,8 @@ PRIZE_QUESTION = "🏆 Выберите приз за победу"
 PRIZE_OPTIONS = ["Антитаргет", "400 евро", "Преф"]
 
 
-@cmd(".приз", perm="games")
+@cmd(".приз", ".призы", perm="games")
 async def c_prize(m, args, bot):
     """Отправляет в чат опрос на приз с тремя вариантами."""
-    await bot.send_poll(m.chat.id, PRIZE_QUESTION, PRIZE_OPTIONS, is_anonymous=False, allows_multiple_answers=False)
+    msg = await bot.send_poll(m.chat.id, PRIZE_QUESTION, PRIZE_OPTIONS, is_anonymous=False, allows_multiple_answers=False)
+    await pin(bot, m.chat.id, msg.message_id)  # опрос на приз закрепляется всегда

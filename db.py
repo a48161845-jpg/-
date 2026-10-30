@@ -1,114 +1,89 @@
-import aiosqlite
+"""Хранилище: онлайн PostgreSQL (asyncpg). Адрес базы — переменная DATABASE_URL в .env."""
+import asyncpg
 
 import config
 
-_db = None
+_pool = None
 
 SCHEMA = """
-CREATE TABLE IF NOT EXISTS users(user_id INTEGER PRIMARY KEY, name TEXT, username TEXT);
+CREATE TABLE IF NOT EXISTS users(user_id BIGINT PRIMARY KEY, name TEXT, username TEXT);
 CREATE INDEX IF NOT EXISTS ix_users_un ON users(username);
-CREATE TABLE IF NOT EXISTS members(chat_id INTEGER, user_id INTEGER, PRIMARY KEY(chat_id,user_id));
-CREATE TABLE IF NOT EXISTS points(user_id INTEGER, team TEXT, value REAL NOT NULL DEFAULT 0,
-    absent INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(user_id,team));
-CREATE INDEX IF NOT EXISTS ix_points_team ON points(team);
-CREATE TABLE IF NOT EXISTS spent(user_id INTEGER PRIMARY KEY, value REAL NOT NULL DEFAULT 0);
-CREATE TABLE IF NOT EXISTS settings(chat_id INTEGER, key TEXT, value TEXT, PRIMARY KEY(chat_id,key));
+CREATE TABLE IF NOT EXISTS members(chat_id BIGINT, user_id BIGINT, PRIMARY KEY(chat_id,user_id));
+CREATE TABLE IF NOT EXISTS settings(chat_id BIGINT, key TEXT, value TEXT, PRIMARY KEY(chat_id,key));
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
-CREATE TABLE IF NOT EXISTS lists(chat_id INTEGER, num INTEGER, template TEXT, state TEXT,
-    msg_id INTEGER, mode TEXT DEFAULT 'name', PRIMARY KEY(chat_id,num));
-CREATE TABLE IF NOT EXISTS games(id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER, dt TEXT,
-    descr TEXT, kind TEXT);
-CREATE TABLE IF NOT EXISTS poll_tpl(chat_id INTEGER, name TEXT, question TEXT, options TEXT,
+CREATE TABLE IF NOT EXISTS lists(chat_id BIGINT, num INTEGER, template TEXT, state TEXT,
+    msg_id BIGINT, mode TEXT DEFAULT 'name', photo TEXT, PRIMARY KEY(chat_id,num));
+CREATE TABLE IF NOT EXISTS games(id BIGSERIAL PRIMARY KEY, chat_id BIGINT, dt TEXT, descr TEXT, kind TEXT);
+CREATE TABLE IF NOT EXISTS poll_tpl(id BIGSERIAL, chat_id BIGINT, name TEXT, question TEXT, options TEXT,
     anon INTEGER DEFAULT 0, multi INTEGER DEFAULT 0, quiz INTEGER DEFAULT 0, correct INTEGER DEFAULT 0,
-    PRIMARY KEY(chat_id,name));
-CREATE TABLE IF NOT EXISTS poll_sent(game_id INTEGER, tpl TEXT, hours REAL, PRIMARY KEY(game_id,tpl,hours));
-CREATE TABLE IF NOT EXISTS shop(id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER, kind TEXT,
-    price REAL, name TEXT, descr TEXT);
-CREATE TABLE IF NOT EXISTS custom(chat_id INTEGER, name TEXT, text TEXT, PRIMARY KEY(chat_id,name));
-CREATE TABLE IF NOT EXISTS warns(id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER, user_id INTEGER,
-    reason TEXT, until REAL, created REAL, by_id INTEGER);
-CREATE TABLE IF NOT EXISTS history(id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER, user_id INTEGER,
-    action TEXT, reason TEXT, until REAL, created REAL, by_id INTEGER);
-CREATE TABLE IF NOT EXISTS caps(chat_id INTEGER, user_id INTEGER, perms TEXT, PRIMARY KEY(chat_id,user_id));
+    once INTEGER DEFAULT 0, PRIMARY KEY(chat_id,name));
+CREATE TABLE IF NOT EXISTS poll_sent(game_id BIGINT, tpl TEXT, hours DOUBLE PRECISION, PRIMARY KEY(game_id,tpl,hours));
+CREATE TABLE IF NOT EXISTS shop(id BIGSERIAL PRIMARY KEY, chat_id BIGINT, kind TEXT, price DOUBLE PRECISION,
+    name TEXT, descr TEXT);
+CREATE TABLE IF NOT EXISTS custom(rid BIGSERIAL, chat_id BIGINT, name TEXT, text TEXT, mtype TEXT, fid TEXT,
+    mode TEXT DEFAULT 'start', PRIMARY KEY(chat_id,name));
+CREATE TABLE IF NOT EXISTS warns(id BIGSERIAL PRIMARY KEY, chat_id BIGINT, user_id BIGINT, reason TEXT,
+    until DOUBLE PRECISION, created DOUBLE PRECISION, by_id BIGINT);
+CREATE TABLE IF NOT EXISTS history(id BIGSERIAL PRIMARY KEY, chat_id BIGINT, user_id BIGINT, action TEXT,
+    reason TEXT, until DOUBLE PRECISION, created DOUBLE PRECISION, by_id BIGINT);
+CREATE TABLE IF NOT EXISTS caps(chat_id BIGINT, user_id BIGINT, perms TEXT, PRIMARY KEY(chat_id,user_id));
 -- единый баланс: каждый закреплён за основной командой (home), баллы одни на всех
-CREATE TABLE IF NOT EXISTS bank(user_id INTEGER PRIMARY KEY, home TEXT NOT NULL, value REAL NOT NULL DEFAULT 0,
+CREATE TABLE IF NOT EXISTS bank(user_id BIGINT PRIMARY KEY, home TEXT NOT NULL, value DOUBLE PRECISION NOT NULL DEFAULT 0,
     absent INTEGER NOT NULL DEFAULT 0);
 CREATE INDEX IF NOT EXISTS ix_bank_home ON bank(home);
 -- набранные списки: хранятся до конца игры, чтобы работали проверки (кик, запрет записи в две команды)
-CREATE TABLE IF NOT EXISTS done_lists(chat_id INTEGER, num INTEGER, ids TEXT, until REAL, PRIMARY KEY(chat_id,num));
+CREATE TABLE IF NOT EXISTS done_lists(chat_id BIGINT, num INTEGER, ids TEXT, until DOUBLE PRECISION, PRIMARY KEY(chat_id,num));
 -- заявки, пришедшие во время закрытого входа (20:00-21:00), бот примет их после 21:00
-CREATE TABLE IF NOT EXISTS join_queue(chat_id INTEGER, user_id INTEGER, ts REAL, PRIMARY KEY(chat_id,user_id));
+CREATE TABLE IF NOT EXISTS join_queue(chat_id BIGINT, user_id BIGINT, ts DOUBLE PRECISION, PRIMARY KEY(chat_id,user_id));
 """
 
 
-async def init(path="bot.db"):
-    global _db
-    _db = await aiosqlite.connect(path)
-    _db.row_factory = aiosqlite.Row
-    await _db.executescript(SCHEMA)
-    for stmt in ("ALTER TABLE lists ADD COLUMN photo TEXT",
-                 "ALTER TABLE poll_tpl ADD COLUMN once INTEGER DEFAULT 0",
-                 "ALTER TABLE custom ADD COLUMN mtype TEXT",
-                 "ALTER TABLE custom ADD COLUMN fid TEXT",
-                 "ALTER TABLE custom ADD COLUMN mode TEXT DEFAULT 'start'"):  # миграция старых баз
-        try:
-            await _db.execute(stmt)
-        except Exception:
-            pass
-    await _db.commit()
-    await migrate_bank()
+def _pg(sql):
+    """Плейсхолдеры ? -> $1, $2, ... (в запросах нет строковых литералов с «?»)."""
+    out, n = [], 0
+    for ch in sql:
+        if ch == "?":
+            n += 1
+            out.append(f"${n}")
+        else:
+            out.append(ch)
+    return "".join(out)
 
 
-async def migrate_bank():
-    """Один раз: сливает баллы по командам (points) минус траты (spent) в единый баланс (bank).
-    Основная команда = чат, где человек состоит; если в обоих — где у него больше баллов,
-    затем та, чья приставка стоит в его имени, затем где он появился раньше."""
-    if await get_meta("bank_v1") == "1":
-        return
-    pts, mem, spent = {}, {}, {}
-    for r in await q("SELECT user_id,team,value,absent FROM points"):
-        pts.setdefault(r["user_id"], {})[r["team"]] = (r["value"], r["absent"])
-    for key, t in config.TEAMS.items():
-        if t["chat_id"]:
-            for r in await q("SELECT user_id, rowid AS rid FROM members WHERE chat_id=?", (t["chat_id"],)):
-                mem.setdefault(r["user_id"], {})[key] = r["rid"]
-    for r in await q("SELECT user_id,value FROM spent"):
-        spent[r["user_id"]] = r["value"]
-    names = {r["user_id"]: r["name"] or "" for r in await q("SELECT user_id,name FROM users")}
-    prefixes = {}
-    for key, t in config.TEAMS.items():
-        pf = await get_setting(t["chat_id"], "prefix", "") if t["chat_id"] else ""
-        prefixes[key] = "".join(pf.split()).lower()
-    for uid in set(pts) | set(mem):
-        p, m = pts.get(uid, {}), mem.get(uid, {})
-        cands = set(m) or set(p)
-        if not cands:
-            continue
-        nm = "".join(names.get(uid, "").split()).lower()
-        home = max(cands, key=lambda k: (p.get(k, (0, 0))[0], bool(prefixes.get(k)) and nm.startswith(prefixes[k]),
-                                         -m.get(k, 10 ** 12)))
-        value = sum(v for v, _ in p.values()) - spent.get(uid, 0)
-        absent = 0 if home in m else p.get(home, (0, 0))[1]
-        await _db.execute("INSERT OR REPLACE INTO bank(user_id,home,value,absent) VALUES(?,?,?,?)", (uid, home, value, absent))
-    await _db.execute("DROP TABLE IF EXISTS twins")
-    await _db.commit()
-    await set_meta("bank_v1", "1")
+async def init(dsn=None):
+    global _pool
+    dsn = dsn or config.DATABASE_URL
+    if not dsn:
+        raise RuntimeError("Не задан DATABASE_URL (адрес онлайн-базы PostgreSQL) в .env")
+    # statement_cache_size=0 — чтобы работало и через pgbouncer (Supabase, Neon и т.п.)
+    _pool = await asyncpg.create_pool(dsn, min_size=1, max_size=5, statement_cache_size=0)
+    async with _pool.acquire() as c:
+        await c.execute(SCHEMA)
+
+
+async def close():
+    if _pool:
+        await _pool.close()
 
 
 async def q(sql, args=()):
-    async with _db.execute(sql, args) as cur:
-        return await cur.fetchall()
+    async with _pool.acquire() as c:
+        return await c.fetch(_pg(sql), *args)
 
 
 async def one(sql, args=()):
-    async with _db.execute(sql, args) as cur:
-        return await cur.fetchone()
+    async with _pool.acquire() as c:
+        return await c.fetchrow(_pg(sql), *args)
 
 
 async def x(sql, args=()):
-    cur = await _db.execute(sql, args)
-    await _db.commit()
-    return cur.lastrowid
+    """Выполняет запрос; возвращает число затронутых строк."""
+    async with _pool.acquire() as c:
+        status = await c.execute(_pg(sql), *args)
+    try:
+        return int(status.split()[-1])
+    except (ValueError, IndexError):
+        return 0
 
 
 async def get_setting(chat_id, key, default=""):
@@ -162,12 +137,11 @@ async def add_member(chat_id, uid):
     if (chat_id, uid) in _mem:
         return False
     _mem.add((chat_id, uid))
-    cur = await _db.execute("INSERT OR IGNORE INTO members(chat_id,user_id) VALUES(?,?)", (chat_id, uid))
+    new = await x("INSERT INTO members(chat_id,user_id) VALUES(?,?) ON CONFLICT DO NOTHING", (chat_id, uid))
     key = config.team_key(chat_id)
     if key:  # первая команда, где человека увидели, становится его основной
-        await _db.execute("INSERT OR IGNORE INTO bank(user_id,home,value,absent) VALUES(?,?,0,0)", (uid, key))
-    await _db.commit()
-    return cur.rowcount > 0
+        await x("INSERT INTO bank(user_id,home,value,absent) VALUES(?,?,0,0) ON CONFLICT DO NOTHING", (uid, key))
+    return new > 0
 
 
 async def remove_member(chat_id, uid):

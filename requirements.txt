@@ -1,5 +1,5 @@
 aiogram>=3.13
-aiosqlite>=0.20
+asyncpg>=0.29
 python-dotenv>=1.0
 Pillow>=10.1
 tzdata

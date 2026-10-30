@@ -114,7 +114,10 @@ async def main():
         logging.exception("MTProto не запустился — работаем без него")
     asyncio.create_task(sync.scheduler(bot))
     asyncio.create_task(sync.sync_members(bot))
-    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    try:
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    finally:
+        await db.close()
 
 
 if __name__ == "__main__":

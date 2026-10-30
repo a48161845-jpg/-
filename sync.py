@@ -167,7 +167,8 @@ async def on_join_request(req, bot):
     if await db.get_setting(req.chat.id, "auto_approve", "1") != "1":
         return
     if join_closed():  # идут Голодные игры: заявка ждёт до 21:00
-        await db.x("INSERT OR REPLACE INTO join_queue(chat_id,user_id,ts) VALUES(?,?,?)", (req.chat.id, uid, time.time()))
+        await db.x("INSERT INTO join_queue(chat_id,user_id,ts) VALUES(?,?,?) "
+                   "ON CONFLICT(chat_id,user_id) DO UPDATE SET ts=excluded.ts", (req.chat.id, uid, time.time()))
         try:
             await bot.send_message(dm, "Сейчас идут Голодные игры (20:00–21:00 МСК), вход закрыт. "
                                        "Заявка сохранена — после 21:00 бот примет вас автоматически.")

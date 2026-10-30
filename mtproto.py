@@ -27,8 +27,14 @@ async def start():
     except ImportError:
         log.warning("telethon не установлен (pip install telethon) — MTProto выключен")
         return False
-    _client = TelegramClient("mt_bot_session", config.API_ID, config.API_HASH)
+    from telethon.sessions import StringSession
+    # сессия хранится в онлайн-базе (meta), а не в файле на диске
+    saved = await db.get_meta("mt_session", "")
+    _client = TelegramClient(StringSession(saved or None), config.API_ID, config.API_HASH)
     await _client.start(bot_token=config.BOT_TOKEN)
+    new = _client.session.save()
+    if new != saved:
+        await db.set_meta("mt_session", new)
     return True
 
 

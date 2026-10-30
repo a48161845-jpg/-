@@ -189,7 +189,8 @@ async def c_add_cap(m, args, bot):
     uid, _ = await resolve_target(m, args)
     if uid is None:
         return await m.reply("Укажите цель: ответом, @ником или ID.")
-    await db.x("INSERT OR REPLACE INTO caps(chat_id,user_id,perms) VALUES(?,?,?)", (m.chat.id, uid, json.dumps(list(PERMS))))
+    await db.x("INSERT INTO caps(chat_id,user_id,perms) VALUES(?,?,?) "
+               "ON CONFLICT(chat_id,user_id) DO UPDATE SET perms=excluded.perms", (m.chat.id, uid, json.dumps(list(PERMS))))
     await m.reply(f"👑 {await user_link(uid)} назначен кэпом. Права: <code>.права {uid}</code>")
 
 
