@@ -57,19 +57,51 @@ async def resolve_username(username):
     return ent.id
 
 
-async def sync_chat(chat_id):
-    """Заносит всех участников чата в базу. Возвращает их количество."""
-    if not _client:
-        return 0
-    n = 0
+async def _find_chat(chat_id, link):
+    """Бот-клиент «видит» чат только по access_hash. Если его нет в кэше сессии — берём из своей пригласительной ссылки."""
     try:
-        async for u in _client.iter_participants(chat_id):
+        return await _client.get_input_entity(chat_id)
+    except Exception:
+        pass
+    if link:
+        from telethon.tl.functions.messages import CheckChatInviteRequest
+        h = link.rstrip("/").split("/")[-1].lstrip("+")
+        res = await _client(CheckChatInviteRequest(h))
+        chat = getattr(res, "chat", None)  # ChatInviteAlready: бот уже в чате
+        if chat is not None:
+            return await _client.get_input_entity(chat)
+    raise ValueError("клиент не видит чат: напишите в нём любое сообщение и убедитесь, что бот — админ")
+
+
+async def _save_session():
+    try:
+        new = _client.session.save()
+        if new != await db.get_meta("mt_session", ""):
+            await db.set_meta("mt_session", new)
+    except Exception:
+        pass
+
+
+async def sync_chat(chat_id, link=None):
+    """Заносит всех участников чата в базу, убирает ушедших. Возвращает (сколько нашли, текст ошибки)."""
+    if not _client:
+        return 0, "MTProto выключен"
+    seen = set()
+    try:
+        peer = await _find_chat(chat_id, link)
+        async for u in _client.iter_participants(peer):
             if getattr(u, "bot", False) or getattr(u, "deleted", False):
                 continue
             await db.touch_user(u.id, _name(u), u.username)
             await db.add_member(chat_id, u.id)
-            n += 1
+            seen.add(u.id)
     except Exception as e:
-        # чаще всего: чат ещё не «виден» клиенту — напишите в нём любое сообщение — повтор будет при ежедневной синхронизации в 00:00 МСК
         log.warning("sync_chat %s failed: %s", chat_id, e)
-    return n
+        return len(seen), str(e)[:150]
+    finally:
+        await _save_session()
+    if seen:  # полный список получен — тех, кого в нём нет, в чате уже нет
+        for r in await db.q("SELECT user_id FROM members WHERE chat_id=?", (chat_id,)):
+            if r["user_id"] not in seen:
+                await db.remove_member(chat_id, r["user_id"])
+    return len(seen), ""

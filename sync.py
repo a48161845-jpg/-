@@ -22,7 +22,7 @@ async def window_active(chat_id):
     n = now()
     for g in await db.q("SELECT dt FROM games WHERE chat_id=?", (chat_id,)):
         left = (datetime.strptime(g["dt"], FMT) - n).total_seconds()
-        if -60 * 60 <= left <= window:
+        if -90 * 60 <= left <= window:
             return True
     return False
 
@@ -45,52 +45,72 @@ async def belongs_to_other(chat_id, uid):
     return bool(oc and await db.one("SELECT 1 FROM members WHERE chat_id=? AND user_id=?", (oc, uid)))
 
 
-async def enforce_team(bot, chat_id):
-    """Перед игрой и во время неё: из чата выгоняем всех, кто состоит в противоположной команде
-    и не записан в списки этой команды. Возвращает (кикнутые, ошибки)."""
-    kicked, errors = [], []
-    key = config.team_key(chat_id)
-    if not key or not await window_active(chat_id):
-        return kicked, errors
-    other_key = config.other_team(key)
-    other = config.TEAMS[other_key]
-    listed = await team_list_ids(chat_id)
-    rows = await db.q(
-        "SELECT m.user_id FROM members m WHERE m.chat_id=? AND (m.user_id IN (SELECT user_id FROM bank WHERE home=?) "
-        "OR (m.user_id NOT IN (SELECT user_id FROM bank) AND m.user_id IN (SELECT user_id FROM members WHERE chat_id=?)))",
-        (chat_id, other_key, other["chat_id"] or 0))
-    safe = set(config.OWNER_IDS) | {bot.id} | {r["user_id"] for r in await db.q("SELECT user_id FROM caps WHERE chat_id=?", (chat_id,))}
-    candidates = [r["user_id"] for r in rows if r["user_id"] not in listed and r["user_id"] not in safe]
-    if not candidates:
-        return kicked, errors
+async def _kick_from(bot, chat, uids, text_fn, kicked, errors):
+    """Исключает людей из чата chat (кроме админов Telegram, кэпов этого чата, создателя и бота)."""
+    safe = set(config.OWNER_IDS) | {bot.id} | {r["user_id"] for r in await db.q("SELECT user_id FROM caps WHERE chat_id=?", (chat,))}
+    uids = [u for u in uids if u not in safe]
+    if not uids:
+        return
     try:
-        admins = {a.user.id for a in await bot.get_chat_administrators(chat_id)}
+        admins = {a.user.id for a in await bot.get_chat_administrators(chat)}
     except Exception:
         admins = set()
-    for uid in candidates:
+    for uid in uids:
         if uid in admins:
             continue
         try:
-            mem = await bot.get_chat_member(chat_id, uid)
+            mem = await bot.get_chat_member(chat, uid)
         except Exception:
             continue
         if mem.status not in ("member", "restricted"):
             continue
         try:
-            await bot.ban_chat_member(chat_id, uid)
-            await bot.unban_chat_member(chat_id, uid, only_if_banned=True)
+            await bot.ban_chat_member(chat, uid)
+            await bot.unban_chat_member(chat, uid, only_if_banned=True)
         except Exception as e:
             log.warning("kick failed %s: %s", uid, e)
             errors.append(f"{await user_name(uid)}: {e}")
             continue
         kicked.append(uid)
         try:
-            await bot.send_message(
-                chat_id,
-                f"🚪 {mention(uid, await user_name(uid))} состоит в команде {other['title']} и не записан(а) в список "
-                f"{config.TEAMS[key]['title']} — исключён(а) на время игры.")
+            await bot.send_message(chat, text_fn(mention(uid, await user_name(uid))))
         except Exception:
             pass
+
+
+async def enforce_team(bot, chat_id):
+    """Перед игрой и во время неё (игра в чате chat_id):
+    1) из этого чата выгоняем всех, кто состоит в противоположной команде и не записан в список этой команды;
+    2) из чата противоположной команды выгоняем всех, кто записан в список этой команды или закреплён за ней —
+       участник сидит только в чате своей (или играющей) команды.
+    Возвращает (кикнутые, ошибки)."""
+    kicked, errors = [], []
+    key = config.team_key(chat_id)
+    if not key or not await window_active(chat_id):
+        return kicked, errors
+    other_key = config.other_team(key)
+    other = config.TEAMS[other_key]
+    here = config.TEAMS[key]
+    listed = await team_list_ids(chat_id)
+    rows = await db.q(
+        "SELECT m.user_id FROM members m WHERE m.chat_id=? AND (m.user_id IN (SELECT user_id FROM bank WHERE home=?) "
+        "OR (m.user_id NOT IN (SELECT user_id FROM bank) AND m.user_id IN (SELECT user_id FROM members WHERE chat_id=?)))",
+        (chat_id, other_key, other["chat_id"] or 0))
+    await _kick_from(
+        bot, chat_id, [r["user_id"] for r in rows if r["user_id"] not in listed],
+        lambda who: f"🚪 {who} состоит в команде {other['title']} и не записан(а) в список {here['title']} — исключён(а) на время игры.",
+        kicked, errors)
+    if other["chat_id"]:
+        # из чата противоположной команды уходят: записанные в список этой команды и все, кто за ней закреплён
+        # (кроме тех, кто записан в список той команды — они играют там)
+        homes = {r["user_id"] for r in await db.q("SELECT user_id FROM bank WHERE home=?", (key,))}
+        other_listed = await team_list_ids(other["chat_id"])
+        there = await db.q("SELECT user_id FROM members WHERE chat_id=?", (other["chat_id"],))
+        await _kick_from(
+            bot, other["chat_id"],
+            [r["user_id"] for r in there if (r["user_id"] in listed or r["user_id"] in homes) and r["user_id"] not in other_listed],
+            lambda who: f"🚪 {who} играет за {here['title']} / состоит в ней — исключён(а) из чата {other['title']} на время игры.",
+            kicked, errors)
     return kicked, errors
 
 
@@ -206,30 +226,70 @@ async def flush_join_queue(bot):
 
 
 async def sync_members(bot):
-    """Собирает участников чатов команд в базу (админы через Bot API, всех — через Telethon, если подключён)."""
+    """Собирает участников чатов команд в базу: админы — через Bot API, все — через Telethon (если подключён).
+    Ушедших из чата убирает. Возвращает отчёт {команда: {"admins": n, "all": n|None, "error": текст}}."""
     import mtproto
-    total = 0
-    for t in config.TEAMS.values():
+    report = {}
+    for key, t in config.TEAMS.items():
         cid = t["chat_id"]
         if not cid:
             continue
+        rep = {"admins": 0, "all": None, "error": ""}
         try:
             for a in await bot.get_chat_administrators(cid):
                 if not a.user.is_bot:
                     await db.touch_user(a.user.id, a.user.full_name, a.user.username)
                     await db.add_member(cid, a.user.id)
-                    total += 1
+                    rep["admins"] += 1
         except Exception as e:
             log.warning("admins sync failed %s: %s", cid, e)
-        total += await mtproto.sync_chat(cid)
-    return total
+            rep["error"] = f"админы: {e}"
+        if mtproto.available():
+            link = None
+            try:
+                link = await team_link(bot, key)
+            except Exception as e:
+                log.warning("invite link failed %s: %s", cid, e)
+            n, err = await mtproto.sync_chat(cid, link)
+            rep["all"] = n
+            if err:
+                rep["error"] = (rep["error"] + "; " if rep["error"] else "") + err
+        else:
+            rep["error"] = (rep["error"] + "; " if rep["error"] else "") + "MTProto выключен (API_ID/API_HASH/telethon) — видны только админы"
+        report[key] = rep
+    return report
+
+
+def _report_text(report, title):
+    lines = [title]
+    bad = False
+    for key, r in report.items():
+        cnt = r["all"] if r["all"] is not None else r["admins"]
+        lines.append(f"• {config.TEAMS[key]['title']}: {cnt} уч." + (f" ⚠️ {r['error']}" if r["error"] else ""))
+        bad |= bool(r["error"]) or not cnt
+    return "\n".join(lines), bad
+
+
+async def notify_owners(bot, text):
+    for uid in config.OWNER_IDS:
+        try:
+            await bot.send_message(uid, text, parse_mode=None)
+        except Exception:
+            pass
+
+
+async def startup_sync(bot):
+    report = await sync_members(bot)
+    text, bad = _report_text(report, "🔄 Синхронизация при запуске")
+    if bad:  # при запуске пишем только о проблемах
+        await notify_owners(bot, text)
 
 
 async def daily_check(bot):
     """Каждый день в 00:00 МСК: собираем участников чатов и проверяем, состоят ли люди в своей основной команде;
-    ушедшие уходят вниз списка баллов."""
+    ушедшие уходят вниз списка баллов. Итог приходит создателю в личку."""
     from economy import refresh_channel
-    await sync_members(bot)
+    report = await sync_members(bot)
     for key, t in config.TEAMS.items():
         if not t["chat_id"]:
             continue
@@ -242,6 +302,7 @@ async def daily_check(bot):
             await db.x("UPDATE bank SET absent=? WHERE user_id=?", (absent, r["user_id"]))
             await asyncio.sleep(0.05)
     await refresh_channel(bot)
+    await notify_owners(bot, _report_text(report, "🔄 Ежедневная синхронизация (00:00 МСК)")[0])
 
 
 async def on_chat_member(upd, bot):

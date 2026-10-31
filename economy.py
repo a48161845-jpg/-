@@ -112,6 +112,14 @@ async def _tg(fn, *a, **kw):
             await asyncio.sleep(e.retry_after + 1)
 
 
+async def _pin(bot, ch, mid):
+    """Закрепляет сообщение без уведомления; без права закреплять у бота — тихо пропускает."""
+    try:
+        await bot.pin_chat_message(ch, mid, disable_notification=True)
+    except Exception as e:
+        log.info("pin failed: %s", e)
+
+
 async def refresh_channel(bot):
     """Обновляет список баллов в канале с минимумом запросов:
     у каждой команды свои сообщения, неизменившиеся (по хэшу) не трогаются, лишние удаляются."""
@@ -127,6 +135,7 @@ async def refresh_channel(bot):
             await db.set_meta("points_msgs", "[]")
 
         state = json.loads(await db.get_meta("points_state", "{}"))
+        pinned_now = set()
         for key, lines in await build_blocks():
             texts = chunk(lines)
             cur = state.get(key, [])
@@ -148,6 +157,9 @@ async def refresh_channel(bot):
                         log.info("edit failed (%s), отправляю заново", e)
                 m = await _tg(bot.send_message, ch, text, parse_mode=None)
                 new.append({"id": m.message_id, "h": h})
+                if i == 0:  # первое сообщение списка команды всегда закреплено
+                    await _pin(bot, ch, m.message_id)
+                    pinned_now.add(m.message_id)
             for old in cur[len(texts):]:
                 try:
                     await bot.delete_message(ch, old["id"])
@@ -155,6 +167,11 @@ async def refresh_channel(bot):
                     pass
             state[key] = new
             await db.set_meta("points_state", json.dumps(state))
+        if await db.get_meta("points_pinned", "") != "1":  # один раз закрепляем уже существующие сообщения
+            for key in config.TEAMS:
+                if state.get(key) and state[key][0]["id"] not in pinned_now:
+                    await _pin(bot, ch, state[key][0]["id"])
+            await db.set_meta("points_pinned", "1")
         for stale in [k for k in state if k not in config.TEAMS]:  # сообщения от старых версий
             for old in state.pop(stale):
                 try:
